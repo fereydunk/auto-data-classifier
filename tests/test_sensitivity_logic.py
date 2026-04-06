@@ -1,50 +1,61 @@
 """
-Tests for sensitivity level classification logic from classifier-service/main.py.
-Extracted here without importing the full app (avoids spaCy/GLiNER at import time).
+Tests for sensitivity level logic — now delegates to classification/taxonomy.py.
+Kept as a focused integration check that the taxonomy wiring is correct end-to-end.
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "classifier-service"))
+
 import pytest
-
-# Mirror the logic from main.py so tests are self-contained and fast
-HIGH_SENSITIVITY_ENTITIES = {
-    "US_SSN", "CREDIT_CARD", "IBAN_CODE", "BANK_ACCOUNT",
-    "US_BANK_ROUTING", "PASSPORT", "DRIVER_LICENSE", "MEDICAL_RECORD",
-    "US_ITIN", "SWIFT_CODE",
-}
-MEDIUM_SENSITIVITY_ENTITIES = {
-    "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION", "DATE_TIME", "IP_ADDRESS",
-}
+from classification.taxonomy import (
+    DataCategory,
+    SensitivityLevel,
+    categorize_entity,
+    sensitivity_for_categories,
+)
 
 
-def sensitivity_level(entity_types: set) -> str:
-    if entity_types & HIGH_SENSITIVITY_ENTITIES:
-        return "HIGH"
-    if entity_types & MEDIUM_SENSITIVITY_ENTITIES:
-        return "MEDIUM"
-    if entity_types:
-        return "LOW"
-    return "CLEAN"
+def sensitivity_from_entity_types(entity_types: set) -> str:
+    """Convenience: go from raw entity type strings → sensitivity level string."""
+    categories = {categorize_entity(e) for e in entity_types}
+    return sensitivity_for_categories(categories).value
 
 
 @pytest.mark.parametrize("entities,expected", [
-    ({"US_SSN"},                        "HIGH"),
-    ({"CREDIT_CARD"},                   "HIGH"),
-    ({"IBAN_CODE"},                     "HIGH"),
-    ({"PASSPORT"},                      "HIGH"),
-    ({"PERSON", "US_SSN"},              "HIGH"),   # HIGH wins over MEDIUM
-    ({"PERSON"},                        "MEDIUM"),
-    ({"EMAIL_ADDRESS"},                 "MEDIUM"),
-    ({"PHONE_NUMBER", "LOCATION"},      "MEDIUM"),
-    ({"SOME_CUSTOM_TYPE"},              "LOW"),    # unknown type → LOW
-    (set(),                             "CLEAN"),  # nothing found
+    # CRITICAL — PHI or CREDENTIALS
+    ({"MEDICAL_RECORD"},            "CRITICAL"),
+    ({"PASSWORD"},                  "CRITICAL"),
+    ({"API_KEY"},                   "CRITICAL"),
+    ({"MEDICAL_CONDITION", "PII"},  "CRITICAL"),
+    # HIGH — PII or PCI
+    ({"US_SSN"},                    "HIGH"),
+    ({"CREDIT_CARD"},               "HIGH"),
+    ({"IBAN_CODE"},                 "HIGH"),
+    ({"PERSON"},                    "HIGH"),
+    ({"EMAIL_ADDRESS"},             "HIGH"),
+    ({"PHONE_NUMBER"},              "HIGH"),
+    ({"PERSON", "US_SSN"},          "HIGH"),
+    # MEDIUM — CONFIDENTIAL only
+    ({"ORGANIZATION"},              "MEDIUM"),
+    ({"CONTRACT_NUMBER"},           "MEDIUM"),
+    # LOW — INTERNAL only
+    ({"ORDER_NUMBER"},              "LOW"),
+    ({"LOYALTY_CARD"},              "LOW"),
+    # CLEAN
+    (set(),                         "CLEAN"),
 ])
-def test_sensitivity_level(entities, expected):
-    assert sensitivity_level(entities) == expected
+def test_sensitivity_from_entity_types(entities, expected):
+    assert sensitivity_from_entity_types(entities) == expected
 
 
-def test_high_beats_medium_when_both_present():
-    mixed = {"PERSON", "EMAIL_ADDRESS", "CREDIT_CARD"}
-    assert sensitivity_level(mixed) == "HIGH"
+def test_phi_beats_pci():
+    assert sensitivity_from_entity_types({"MEDICAL_RECORD", "CREDIT_CARD"}) == "CRITICAL"
 
 
-def test_empty_set_is_clean():
-    assert sensitivity_level(set()) == "CLEAN"
+def test_credentials_beats_pii():
+    assert sensitivity_from_entity_types({"PASSWORD", "PERSON"}) == "CRITICAL"
+
+
+def test_empty_is_clean():
+    assert sensitivity_from_entity_types(set()) == "CLEAN"

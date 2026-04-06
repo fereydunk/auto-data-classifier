@@ -1,14 +1,17 @@
 """
 Confluent Stream Catalog field tagger.
 
-After classification, applies sensitivity tags to schema fields in the
-Confluent Stream Catalog so data stewards can see PII exposure across
-the entire catalog — without looking at message content.
+After classification, applies data category tags directly to schema fields
+in the Confluent Stream Catalog, so data stewards get meaningful, actionable
+labels — not just high/medium/low buckets.
 
-Tag hierarchy applied:
-  HIGH sensitivity  → "PII" tag
-  MEDIUM sensitivity → "SENSITIVE" tag
-  LOW sensitivity   → "INTERNAL" tag
+Tags applied per field (one tag per field, highest category wins):
+  PHI         → Protected Health Information
+  CREDENTIALS → Passwords, tokens, API keys
+  PII         → Personally Identifiable Information
+  PCI         → Payment Card / financial account data
+  CONFIDENTIAL → Business-confidential data
+  INTERNAL    → Internal operational data
 
 All operations are idempotent — safe to call on every message.
 A local cache prevents redundant API calls for already-tagged fields.
@@ -22,46 +25,70 @@ import httpx
 
 logger = logging.getLogger("catalog_tagger")
 
-# Confluent entity type for a schema field in the Stream Catalog
 SR_FIELD_TYPE = "sr_field"
 
-# Maps sensitivity level → catalog tag name
-SENSITIVITY_TAG_MAP = {
-    "HIGH":   "PII",
-    "MEDIUM": "SENSITIVE",
-    "LOW":    "INTERNAL",
-}
-
-# Tag definitions to ensure exist before use
+# ---------------------------------------------------------------------------
+# Category tag definitions — one per DataCategory
+# ---------------------------------------------------------------------------
 TAG_DEFINITIONS = [
     {
         "name": "PII",
         "entityTypes": [SR_FIELD_TYPE],
-        "description": "Field contains Personally Identifiable Information",
+        "description": "Personally Identifiable Information — name, email, SSN, passport, etc.",
         "attributeDefs": [
-            {"name": "entity_types", "typeName": "string", "isOptional": True},
-            {"name": "classified_by", "typeName": "string", "isOptional": True},
+            {"name": "entity_types",   "typeName": "string", "isOptional": True},
+            {"name": "classified_by",  "typeName": "string", "isOptional": True},
         ],
     },
     {
-        "name": "SENSITIVE",
+        "name": "PHI",
         "entityTypes": [SR_FIELD_TYPE],
-        "description": "Field contains sensitive data (medium sensitivity)",
+        "description": "Protected Health Information — medical records, diagnoses, medications.",
         "attributeDefs": [
-            {"name": "entity_types", "typeName": "string", "isOptional": True},
-            {"name": "classified_by", "typeName": "string", "isOptional": True},
+            {"name": "entity_types",   "typeName": "string", "isOptional": True},
+            {"name": "classified_by",  "typeName": "string", "isOptional": True},
+        ],
+    },
+    {
+        "name": "PCI",
+        "entityTypes": [SR_FIELD_TYPE],
+        "description": "Payment Card Industry data — credit cards, bank accounts, IBAN, crypto wallets.",
+        "attributeDefs": [
+            {"name": "entity_types",   "typeName": "string", "isOptional": True},
+            {"name": "classified_by",  "typeName": "string", "isOptional": True},
+        ],
+    },
+    {
+        "name": "CREDENTIALS",
+        "entityTypes": [SR_FIELD_TYPE],
+        "description": "Authentication credentials — passwords, API keys, tokens, connection strings.",
+        "attributeDefs": [
+            {"name": "entity_types",   "typeName": "string", "isOptional": True},
+            {"name": "classified_by",  "typeName": "string", "isOptional": True},
+        ],
+    },
+    {
+        "name": "CONFIDENTIAL",
+        "entityTypes": [SR_FIELD_TYPE],
+        "description": "Confidential business data — contracts, trade secrets, strategy.",
+        "attributeDefs": [
+            {"name": "entity_types",   "typeName": "string", "isOptional": True},
+            {"name": "classified_by",  "typeName": "string", "isOptional": True},
         ],
     },
     {
         "name": "INTERNAL",
         "entityTypes": [SR_FIELD_TYPE],
-        "description": "Field contains internal data (low sensitivity)",
+        "description": "Internal operational data — order IDs, loyalty cards, shipment tracking.",
         "attributeDefs": [
-            {"name": "entity_types", "typeName": "string", "isOptional": True},
-            {"name": "classified_by", "typeName": "string", "isOptional": True},
+            {"name": "entity_types",   "typeName": "string", "isOptional": True},
+            {"name": "classified_by",  "typeName": "string", "isOptional": True},
         ],
     },
 ]
+
+# Category priority (highest wins when multiple categories on one field)
+_CATEGORY_PRIORITY = ["PHI", "CREDENTIALS", "PCI", "PII", "CONFIDENTIAL", "INTERNAL"]
 
 
 def _field_qualified_name(sr_cluster_id: str, subject: str, version: int, field_path: str) -> str:
@@ -84,6 +111,14 @@ def extract_schema_id_from_wire(raw: bytes) -> Optional[int]:
     return schema_id
 
 
+def _highest_category(categories: List[str]) -> str:
+    """Return the highest-priority category from a list."""
+    for cat in _CATEGORY_PRIORITY:
+        if cat in categories:
+            return cat
+    return "INTERNAL"
+
+
 class CatalogTagger:
     def __init__(
         self,
@@ -91,15 +126,14 @@ class CatalogTagger:
         sr_api_key: str,
         sr_api_secret: str,
         sr_cluster_id: str,
-        classifier_version: str = "1.0.0",
+        classifier_version: str = "2.0.0",
     ):
         self._base_url = sr_url.rstrip("/")
         self._auth = (sr_api_key, sr_api_secret)
         self._sr_cluster_id = sr_cluster_id
         self._classifier_version = classifier_version
 
-        # Cache of (subject, version, field_path, tag) already applied
-        # Prevents duplicate API calls within a single process lifetime
+        # Cache of (subject, version, field_path, tag) tuples already applied
         self._tagged: Set[tuple] = set()
         self._tags_bootstrapped = False
 
@@ -139,13 +173,12 @@ class CatalogTagger:
             resp.raise_for_status()
             return resp.json().get("version")
         except httpx.HTTPError as e:
-            logger.warning("Could not fetch latest version for subject '%s': %s", subject, e)
+            logger.warning("Could not fetch latest version for '%s': %s", subject, e)
             return None
 
     async def _get_version_for_schema_id(
         self, client: httpx.AsyncClient, subject: str, schema_id: int
     ) -> Optional[int]:
-        """Resolve a schema ID to a version number within a subject."""
         url = f"{self._base_url}/subjects/{subject}/versions"
         try:
             resp = await client.get(url, auth=self._auth)
@@ -158,7 +191,7 @@ class CatalogTagger:
                 if v_resp.status_code == 200 and v_resp.json().get("id") == schema_id:
                     return version
         except httpx.HTTPError as e:
-            logger.warning("Version lookup failed for subject '%s' schema %d: %s", subject, schema_id, e)
+            logger.warning("Version lookup failed for '%s' schema %d: %s", subject, schema_id, e)
         return None
 
     # -------------------------------------------------------------------------
@@ -205,18 +238,11 @@ class CatalogTagger:
             )
             if resp.status_code in (200, 201, 204):
                 self._tagged.add(cache_key)
-                logger.info(
-                    "Tagged field '%s' (subject=%s v%d) as %s",
-                    field_path, subject, version, tag_name,
-                )
+                logger.info("Tagged '%s' (subject=%s v%d) → %s", field_path, subject, version, tag_name)
             elif resp.status_code == 409:
-                # Already tagged — treat as success
-                self._tagged.add(cache_key)
+                self._tagged.add(cache_key)  # already exists — idempotent
             else:
-                logger.warning(
-                    "Unexpected status %d tagging field '%s': %s",
-                    resp.status_code, field_path, resp.text,
-                )
+                logger.warning("Unexpected status %d tagging '%s': %s", resp.status_code, field_path, resp.text)
         except httpx.HTTPError as e:
             logger.error("Failed to tag field '%s': %s", field_path, e)
 
@@ -231,13 +257,17 @@ class CatalogTagger:
         schema_id: Optional[int] = None,
     ) -> None:
         """
-        Apply catalog tags for all detected PII fields.
+        Apply category-based catalog tags for all fields that had entities detected.
+
+        Each field receives the highest-priority category tag among its detected
+        entities (e.g. a field with both PERSON and MEDICAL_CONDITION gets PHI).
 
         Args:
-            client:           shared httpx client
-            topic:            source Kafka topic (used to derive SR subject)
-            detected_entities: from classifier — {field_path: [entity, ...]}
-            schema_id:        Confluent schema ID from wire format (optional)
+            client:            shared httpx client
+            topic:             source Kafka topic (subject = topic + "-value")
+            detected_entities: from classifier response — {field_path: [entity, ...]}
+                               each entity dict must have "entity_type" and "category"
+            schema_id:         Confluent wire-format schema ID (optional)
         """
         if not detected_entities:
             return
@@ -246,48 +276,25 @@ class CatalogTagger:
 
         subject = f"{topic}-value"
 
-        # Resolve which schema version to tag
+        version = None
         if schema_id is not None:
             version = await self._get_version_for_schema_id(client, subject, schema_id)
-        else:
-            version = None
-
         if version is None:
             version = await self._get_latest_version(client, subject)
-
         if version is None:
-            logger.warning("Cannot resolve schema version for subject '%s' — skipping catalog tagging", subject)
+            logger.warning("Cannot resolve schema version for '%s' — skipping catalog tagging", subject)
             return
 
-        # Apply tags per field
         for field_path, entities in detected_entities.items():
             if not entities:
                 continue
 
-            # Determine highest sensitivity for this field
             entity_types = [e["entity_type"] for e in entities]
-            high_types = {e for e in entity_types if e in _HIGH_ENTITIES}
-            medium_types = {e for e in entity_types if e in _MEDIUM_ENTITIES}
+            # Use category from classifier response if present; fall back to entity_type lookup
+            categories = [e.get("category", "INTERNAL") for e in entities]
+            tag = _highest_category(categories)
 
-            if high_types:
-                tag = "PII"
-            elif medium_types:
-                tag = "SENSITIVE"
-            else:
-                tag = "INTERNAL"
-
-            # Strip array indices from path (e.g. "items[0].name" → "items.name")
+            # Strip array indices (e.g. "items[0].name" → "items.name")
             clean_path = field_path.replace("[", ".").replace("]", "").strip(".")
 
             await self._apply_tag(client, subject, version, clean_path, tag, entity_types)
-
-
-# Entity type sets (mirrors classifier/main.py — keep in sync)
-_HIGH_ENTITIES = {
-    "US_SSN", "CREDIT_CARD", "IBAN_CODE", "BANK_ACCOUNT",
-    "US_BANK_ROUTING", "PASSPORT", "DRIVER_LICENSE", "MEDICAL_RECORD",
-    "US_ITIN", "SWIFT_CODE",
-}
-_MEDIUM_ENTITIES = {
-    "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "LOCATION", "DATE_TIME", "IP_ADDRESS",
-}

@@ -6,25 +6,114 @@ from gliner import GLiNER
 from presidio_analyzer import EntityRecognizer, RecognizerResult
 from presidio_analyzer.nlp_engine import NlpArtifacts
 
-# Mapping from GLiNER labels → Presidio entity types
-GLINER_ENTITY_MAP = {
-    "person":                  "PERSON",
-    "email address":           "EMAIL_ADDRESS",
-    "phone number":            "PHONE_NUMBER",
-    "address":                 "LOCATION",
-    "date of birth":           "DATE_TIME",
-    "credit card number":      "CREDIT_CARD",
-    "social security number":  "US_SSN",
-    "bank account number":     "BANK_ACCOUNT",
-    "passport number":         "PASSPORT",
-    "driver's license":        "DRIVER_LICENSE",
-    "ip address":              "IP_ADDRESS",
-    "medical record number":   "MEDICAL_RECORD",
-    "tax id":                  "US_ITIN",
-    "iban":                    "IBAN_CODE",
-    "swift code":              "SWIFT_CODE",
-    "routing number":          "US_BANK_ROUTING",
+# ---------------------------------------------------------------------------
+# GLiNER natural-language label → Presidio entity type
+#
+# GLiNER is a zero-shot NER model: labels are plain English phrases.
+# Grouped by DataCategory for readability — adding new verticals means
+# appending entries here and registering the entity type in taxonomy.py.
+# ---------------------------------------------------------------------------
+# fmt: off
+GLINER_ENTITY_MAP: dict[str, str] = {
+
+    # ── PII — universal ─────────────────────────────────────────────────────
+    "person":                               "PERSON",
+    "full name":                            "PERSON",
+    "first name":                           "PERSON",
+    "last name":                            "PERSON",
+    "email address":                        "EMAIL_ADDRESS",
+    "phone number":                         "PHONE_NUMBER",
+    "mobile number":                        "PHONE_NUMBER",
+    "home address":                         "LOCATION",
+    "street address":                       "LOCATION",
+    "mailing address":                      "LOCATION",
+    "date of birth":                        "DATE_TIME",
+    "birthday":                             "DATE_TIME",
+    "social security number":               "US_SSN",
+    "ssn":                                  "US_SSN",
+    "national insurance number":            "NIN",
+    "social insurance number":              "SIN",
+    "tax file number":                      "AU_TFN",
+    "passport number":                      "PASSPORT",
+    "driver's license":                     "DRIVER_LICENSE",
+    "driver license number":                "DRIVER_LICENSE",
+    "ip address":                           "IP_ADDRESS",
+    "gender":                               "GENDER",
+    "nationality":                          "NATIONALITY",
+    "religion":                             "RELIGION",
+    "race":                                 "RACE_ETHNICITY",
+    "ethnicity":                            "RACE_ETHNICITY",
+    "username":                             "USERNAME",
+    "employee id":                          "EMPLOYEE_ID",
+    "employee number":                      "EMPLOYEE_ID",
+    "customer id":                          "CUSTOMER_ID",
+    "member id":                            "CUSTOMER_ID",
+    "tax id":                               "US_ITIN",
+    "individual taxpayer identification":   "US_ITIN",
+
+    # ── PCI — payment / financial accounts ──────────────────────────────────
+    "credit card number":                   "CREDIT_CARD",
+    "debit card number":                    "CREDIT_CARD",
+    "payment card number":                  "CREDIT_CARD",
+    "bank account number":                  "BANK_ACCOUNT",
+    "iban":                                 "IBAN_CODE",
+    "swift code":                           "SWIFT_CODE",
+    "bic code":                             "SWIFT_CODE",
+    "routing number":                       "US_BANK_ROUTING",
+    "aba routing number":                   "US_BANK_ROUTING",
+    "cryptocurrency wallet":                "CRYPTO_WALLET",
+    "bitcoin address":                      "CRYPTO_WALLET",
+    "ethereum address":                     "CRYPTO_WALLET",
+
+    # ── PHI — healthcare ────────────────────────────────────────────────────
+    "medical record number":                "MEDICAL_RECORD",
+    "health insurance number":              "HEALTH_INSURANCE",
+    "insurance member id":                  "HEALTH_INSURANCE",
+    "health plan id":                       "HEALTH_INSURANCE",
+    "diagnosis":                            "MEDICAL_CONDITION",
+    "medical condition":                    "MEDICAL_CONDITION",
+    "disease":                              "MEDICAL_CONDITION",
+    "medication":                           "MEDICATION",
+    "prescription":                         "MEDICATION",
+    "drug name":                            "MEDICATION",
+    "npi number":                           "NPI",
+    "national provider identifier":         "NPI",
+    "dea number":                           "DEA_NUMBER",
+    "biometric data":                       "BIOMETRIC",
+    "fingerprint":                          "BIOMETRIC",
+    "facial recognition data":              "BIOMETRIC",
+    "retinal scan":                         "BIOMETRIC",
+
+    # ── CREDENTIALS ─────────────────────────────────────────────────────────
+    "password":                             "PASSWORD",
+    "api key":                              "API_KEY",
+    "secret key":                           "SECRET_KEY",
+    "access token":                         "ACCESS_TOKEN",
+    "bearer token":                         "ACCESS_TOKEN",
+    "private key":                          "PRIVATE_KEY",
+    "connection string":                    "CONNECTION_STRING",
+    "database password":                    "PASSWORD",
+
+    # ── CONFIDENTIAL — business ──────────────────────────────────────────────
+    "organization":                         "ORGANIZATION",
+    "company name":                         "ORGANIZATION",
+    "contract number":                      "CONTRACT_NUMBER",
+    "trade secret":                         "TRADE_SECRET",
+
+    # ── INTERNAL — operational ───────────────────────────────────────────────
+    "order number":                         "ORDER_NUMBER",
+    "order id":                             "ORDER_NUMBER",
+    "loyalty card number":                  "LOYALTY_CARD",
+    "rewards card number":                  "LOYALTY_CARD",
+    "license plate":                        "LICENSE_PLATE",
+    "vehicle identification number":        "VEHICLE_ID",
+    "vin":                                  "VEHICLE_ID",
+    "product id":                           "PRODUCT_ID",
+    "sku":                                  "PRODUCT_ID",
+    "shipment id":                          "SHIPMENT_ID",
+    "tracking number":                      "SHIPMENT_ID",
 }
+# fmt: on
 
 
 class GLiNERRecognizer(EntityRecognizer):
@@ -42,7 +131,7 @@ class GLiNERRecognizer(EntityRecognizer):
         self._gliner_labels = list(GLINER_ENTITY_MAP.keys())
 
         if supported_entities is None:
-            supported_entities = list(GLINER_ENTITY_MAP.values())
+            supported_entities = list(set(GLINER_ENTITY_MAP.values()))
 
         super().__init__(
             supported_entities=supported_entities,
@@ -59,9 +148,8 @@ class GLiNERRecognizer(EntityRecognizer):
         entities: List[str],
         nlp_artifacts: Optional[NlpArtifacts] = None,
     ) -> List[RecognizerResult]:
-        results = []
         if not text or not text.strip():
-            return results
+            return []
 
         predictions = self.gliner_model.predict_entities(
             text,
@@ -69,6 +157,7 @@ class GLiNERRecognizer(EntityRecognizer):
             threshold=self.threshold,
         )
 
+        results = []
         for pred in predictions:
             presidio_type = GLINER_ENTITY_MAP.get(pred["label"])
             if presidio_type and presidio_type in entities:
