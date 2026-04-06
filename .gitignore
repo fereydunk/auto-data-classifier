@@ -10,6 +10,11 @@ venv/
 dist/
 build/
 
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
 # HuggingFace model cache
 .cache/
 

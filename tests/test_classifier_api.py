@@ -5,11 +5,9 @@ AnalyzerEngine is mocked — no spaCy or GLiNER needed.
 import sys
 from unittest.mock import MagicMock, patch
 
-# Stub heavy ML dependencies before main.py is imported so tests
-# run without gliner/torch/spaCy installed in the test environment.
+# Stub GLiNER (not installed in the test venv — lives in the Docker image).
+# spaCy is installed and real, so we do NOT stub it here.
 sys.modules.setdefault("gliner", MagicMock())
-sys.modules.setdefault("torch", MagicMock())
-sys.modules.setdefault("spacy", MagicMock())
 
 import pytest
 from fastapi.testclient import TestClient
