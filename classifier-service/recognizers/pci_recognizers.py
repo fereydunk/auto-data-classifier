@@ -21,11 +21,24 @@ class IBANRecognizer(PatternRecognizer):
 
 
 class SwiftCodeRecognizer(PatternRecognizer):
+    # Tightened: require all-uppercase and anchor to known bank country codes
+    # to avoid false positives on common English words.
     PATTERNS = [
         Pattern(
             name="SWIFT_BIC",
-            regex=r"\b[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?\b",
-            score=0.85,
+            regex=(
+                r"\b[A-Z]{4}"                              # bank code (4 uppercase)
+                r"(?:AD|AE|AF|AG|AL|AM|AO|AR|AT|AU|AZ|BA|BB|BD|BE|BF|BG|BH|BI|BJ|BN|BO|BR|BS|BT|BW|BY|BZ"
+                r"|CA|CD|CF|CG|CH|CI|CL|CM|CN|CO|CR|CU|CV|CY|CZ|DE|DJ|DK|DM|DO|DZ|EC|EE|EG|ER|ES|ET|FI|FJ"
+                r"|FM|FR|GA|GB|GD|GE|GH|GM|GN|GQ|GR|GT|GW|GY|HN|HR|HT|HU|ID|IE|IL|IN|IQ|IR|IS|IT|JM|JO|JP"
+                r"|KE|KG|KH|KI|KM|KN|KP|KR|KW|KZ|LA|LB|LC|LI|LK|LR|LS|LT|LU|LV|LY|MA|MC|MD|ME|MG|MH|MK"
+                r"|ML|MM|MN|MR|MT|MU|MV|MW|MX|MY|MZ|NA|NE|NG|NI|NL|NO|NP|NR|NZ|OM|PA|PE|PG|PH|PK|PL|PT"
+                r"|PW|PY|QA|RO|RS|RU|RW|SA|SB|SC|SD|SE|SG|SI|SK|SL|SM|SN|SO|SR|SS|ST|SV|SY|SZ|TC|TD|TG|TH"
+                r"|TJ|TL|TM|TN|TO|TR|TT|TV|TZ|UA|UG|US|UY|UZ|VA|VC|VE|VN|VU|WS|XK|YE|ZA|ZM|ZW)"
+                r"[A-Z0-9]{2}"                             # location code (2)
+                r"(?:[A-Z0-9]{3})?\b"                      # branch code (3, optional)
+            ),
+            score=0.90,
         )
     ]
 

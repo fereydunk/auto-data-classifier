@@ -56,16 +56,20 @@ class GenericAPIKeyRecognizer(PatternRecognizer):
     """
     Common API key formats (hex or base62, 32–64 chars).
     Low confidence alone — intended to complement GLiNER context detection.
+    Ethereum (0x + 40 hex) and Bitcoin addresses are excluded; those are
+    handled by CryptoWalletRecognizer with higher confidence.
     """
     PATTERNS = [
         Pattern(
             name="API_KEY_HEX",
-            regex=r"\b[a-f0-9]{32,64}\b",
+            # 32-64 lowercase hex chars, but NOT 0x-prefixed (crypto wallets)
+            regex=r"(?<!0x)\b[a-f0-9]{32,64}\b",
             score=0.35,
         ),
         Pattern(
             name="API_KEY_ALPHANUM",
-            regex=r"\b[A-Za-z0-9]{40,64}\b",
+            # Mixed-case alphanumeric 40-64 chars, not starting with 0x or eyJ (JWT handled separately)
+            regex=r"\b(?!0x)(?!eyJ)[A-Za-z0-9]{40,64}\b",
             score=0.30,
         ),
     ]
