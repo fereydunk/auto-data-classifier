@@ -18,7 +18,7 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import SerializationContext, MessageField
 
 from config import Config
-from catalog_tagger import CatalogTagger, extract_schema_id_from_wire
+from catalog_tagger import extract_schema_id_from_wire
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,15 +150,48 @@ def _delivery_report(err, msg):
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+async def post_recommendations(
+    client: httpx.AsyncClient,
+    topic: str,
+    detected_entities: Dict[str, Any],
+    schema_id: Optional[int],
+) -> None:
+    """
+    For each (field, tag) pair in detected_entities, POST one recommendation
+    to the review API using the highest-confidence entity for that pair.
+    """
+    subject = f"{topic}-value"
+    for field_path, entities in detected_entities.items():
+        # Group by tag — keep the highest-confidence entity per tag
+        tag_best: Dict[str, Any] = {}
+        for entity in entities:
+            tag = entity.get("tag", "PII")
+            if tag not in tag_best or entity["score"] > tag_best[tag]["score"]:
+                tag_best[tag] = entity
+
+        for tag, entity in tag_best.items():
+            try:
+                await client.post(
+                    f"{cfg.REVIEW_API_URL}/recommendations",
+                    json={
+                        "topic": topic,
+                        "subject": subject,
+                        "schema_id": schema_id,
+                        "field_path": field_path,
+                        "proposed_tag": tag,
+                        "entity_type": entity["entity_type"],
+                        "confidence": entity["score"],
+                    },
+                    timeout=5.0,
+                )
+            except httpx.HTTPError as e:
+                logger.warning(
+                    "Failed to post recommendation for %s → %s: %s", field_path, tag, e
+                )
+
+
 async def run():
     avro_deserializer = build_avro_deserializer()
-    tagger = CatalogTagger(
-        sr_url=cfg.SR_URL,
-        sr_api_key=cfg.SR_API_KEY,
-        sr_api_secret=cfg.SR_API_SECRET,
-        sr_cluster_id=cfg.SR_CLUSTER_ID,
-    )
-
     consumer = Consumer(cfg.kafka_consumer_config)
     producer = Producer(cfg.kafka_producer_config)
     consumer.subscribe([cfg.SOURCE_TOPIC])
@@ -207,14 +240,11 @@ async def run():
                     if result:
                         route_message(producer, p, result, k)
 
-                        # Tag schema fields in Stream Catalog (non-blocking best-effort)
+                        # Post recommendations to the review API (non-blocking best-effort)
                         detected = result.get("detected_entities", {})
                         if detected:
-                            await tagger.apply_classifications(
-                                client=http_client,
-                                topic=cfg.SOURCE_TOPIC,
-                                detected_entities=detected,
-                                schema_id=sid,
+                            await post_recommendations(
+                                http_client, cfg.SOURCE_TOPIC, detected, sid
                             )
                     else:
                         logger.warning("Classification failed — message skipped")

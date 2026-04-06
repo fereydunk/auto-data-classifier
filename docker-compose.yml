@@ -22,12 +22,35 @@ services:
       start_period: 60s   # GLiNER takes a moment to load
     restart: unless-stopped
 
+  review-api:
+    build:
+      context: ./review-api
+    container_name: review-api
+    ports:
+      - "8001:8001"
+    environment:
+      - CONFLUENT_SR_URL=${CONFLUENT_SR_URL}
+      - CONFLUENT_SR_API_KEY=${CONFLUENT_SR_API_KEY}
+      - CONFLUENT_SR_API_SECRET=${CONFLUENT_SR_API_SECRET}
+      - CONFLUENT_SR_CLUSTER_ID=${CONFLUENT_SR_CLUSTER_ID}
+      - DB_PATH=/data/recommendations.db
+    volumes:
+      - recommendations-db:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
   pipeline:
     build:
       context: ./kafka-pipeline
     container_name: kafka-pipeline
     depends_on:
       classifier:
+        condition: service_healthy
+      review-api:
         condition: service_healthy
     environment:
       - CONFLUENT_BOOTSTRAP_SERVERS=${CONFLUENT_BOOTSTRAP_SERVERS}
@@ -38,13 +61,14 @@ services:
       - CONFLUENT_SR_API_SECRET=${CONFLUENT_SR_API_SECRET}
       - CONFLUENT_SR_CLUSTER_ID=${CONFLUENT_SR_CLUSTER_ID}
       - SOURCE_TOPIC=${SOURCE_TOPIC:-raw-messages}
-      - SINK_TOPIC_PII=${SINK_TOPIC_PII:-classified-pii}
-      - SINK_TOPIC_MEDIUM=${SINK_TOPIC_MEDIUM:-classified-medium}
+      - SINK_TOPIC_CLASSIFIED=${SINK_TOPIC_CLASSIFIED:-classified-messages}
       - SINK_TOPIC_SAFE=${SINK_TOPIC_SAFE:-classified-safe}
       - SINK_TOPIC_AUDIT=${SINK_TOPIC_AUDIT:-classification-audit}
       - CONSUMER_GROUP=${CONSUMER_GROUP:-auto-data-classifier}
       - CLASSIFIER_URL=http://classifier:8000
+      - REVIEW_API_URL=http://review-api:8001
     restart: unless-stopped
 
 volumes:
   huggingface-cache:
+  recommendations-db:

@@ -32,6 +32,9 @@ class Config:
     # Classifier service (local)
     CLASSIFIER_URL: str = os.getenv("CLASSIFIER_URL", "http://localhost:8000")
 
+    # Review API (local)
+    REVIEW_API_URL: str = os.getenv("REVIEW_API_URL", "http://localhost:8001")
+
     # Tuning
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "50"))
     CLASSIFIER_TIMEOUT_S: float = float(os.getenv("CLASSIFIER_TIMEOUT_S", "5.0"))
