@@ -1,0 +1,109 @@
+"""
+Tests for the /classify and /health FastAPI endpoints.
+AnalyzerEngine is mocked — no spaCy or GLiNER needed.
+"""
+import sys
+from unittest.mock import MagicMock, patch
+
+# Stub heavy ML dependencies before main.py is imported so tests
+# run without gliner/torch/spaCy installed in the test environment.
+sys.modules.setdefault("gliner", MagicMock())
+sys.modules.setdefault("torch", MagicMock())
+sys.modules.setdefault("spacy", MagicMock())
+
+import pytest
+from fastapi.testclient import TestClient
+from presidio_analyzer import RecognizerResult
+
+
+def _make_result(entity_type, start, end, score=0.9):
+    return RecognizerResult(entity_type=entity_type, start=start, end=end, score=score)
+
+
+@pytest.fixture()
+def client():
+    """TestClient with a mocked analyzer injected at module level."""
+    mock_analyzer = MagicMock()
+
+    with patch("main.build_analyzer", return_value=mock_analyzer):
+        import main as app_module
+        app_module.analyzer = mock_analyzer
+        with TestClient(app_module.app) as c:
+            c._mock_analyzer = mock_analyzer
+            yield c
+
+
+class TestHealthEndpoint:
+    def test_returns_ok_when_analyzer_ready(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        assert resp.json()["analyzer_ready"] is True
+
+
+class TestClassifyEndpoint:
+    def test_detects_ssn(self, client):
+        client._mock_analyzer.analyze.return_value = [
+            _make_result("US_SSN", 16, 27, score=0.97)
+        ]
+        resp = client.post("/classify", json={"fields": {"note": "SSN is 123-45-6789"}})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["sensitivity_level"] == "HIGH"
+        assert "note" in body["detected_entities"]
+        assert body["detected_entities"]["note"][0]["entity_type"] == "US_SSN"
+
+    def test_detects_person_as_medium(self, client):
+        client._mock_analyzer.analyze.return_value = [
+            _make_result("PERSON", 0, 10, score=0.88)
+        ]
+        resp = client.post("/classify", json={"fields": {"name": "John Smith"}})
+        assert resp.status_code == 200
+        assert resp.json()["sensitivity_level"] == "MEDIUM"
+
+    def test_clean_message_returns_clean(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"status": "approved"}})
+        assert resp.status_code == 200
+        assert resp.json()["sensitivity_level"] == "CLEAN"
+        assert resp.json()["detected_entities"] == {}
+
+    def test_nested_fields_are_flattened(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={
+            "fields": {"customer": {"name": "Alice", "address": {"city": "NYC"}}}
+        })
+        assert resp.status_code == 200
+        # Analyzer should have been called once per leaf field
+        assert client._mock_analyzer.analyze.call_count == 2
+
+    def test_response_includes_classifier_version(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"x": "y"}})
+        assert "classifier_version" in resp.json()
+        assert "classified_at" in resp.json()
+
+    def test_high_beats_medium_in_same_message(self, client):
+        def side_effect(text, language):
+            if "ssn" in text.lower():
+                return [_make_result("US_SSN", 0, 10)]
+            return [_make_result("PERSON", 0, 5)]
+
+        client._mock_analyzer.analyze.side_effect = side_effect
+        resp = client.post("/classify", json={
+            "fields": {"note": "ssn 123", "name": "Alice"}
+        })
+        assert resp.json()["sensitivity_level"] == "HIGH"
+
+    def test_numeric_field_is_stringified(self, client):
+        """Non-string leaf values should be coerced to string and analyzed."""
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"amount": 9999.99}})
+        assert resp.status_code == 200
+        assert client._mock_analyzer.analyze.called
+
+    def test_empty_fields_object(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {}})
+        assert resp.status_code == 200
+        assert resp.json()["sensitivity_level"] == "CLEAN"

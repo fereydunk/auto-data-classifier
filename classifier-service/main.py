@@ -7,6 +7,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
@@ -65,14 +67,17 @@ def build_analyzer() -> AnalyzerEngine:
     return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=["en"])
 
 
-app = FastAPI(title="Auto Data Classifier", version=CLASSIFIER_VERSION)
 analyzer: Optional[AnalyzerEngine] = None
 
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global analyzer
     analyzer = build_analyzer()
+    yield
+
+
+app = FastAPI(title="Auto Data Classifier", version=CLASSIFIER_VERSION, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
