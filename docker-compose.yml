@@ -1,0 +1,50 @@
+version: "3.9"
+
+services:
+
+  classifier:
+    build:
+      context: ./classifier-service
+    container_name: classifier
+    ports:
+      - "8000:8000"
+    environment:
+      - TRANSFORMERS_OFFLINE=1   # no HuggingFace outbound calls after model download
+      - HF_HUB_OFFLINE=1
+    volumes:
+      # Mount HuggingFace cache so model survives container restarts
+      - huggingface-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s   # GLiNER takes a moment to load
+    restart: unless-stopped
+
+  pipeline:
+    build:
+      context: ./kafka-pipeline
+    container_name: kafka-pipeline
+    depends_on:
+      classifier:
+        condition: service_healthy
+    environment:
+      - CONFLUENT_BOOTSTRAP_SERVERS=${CONFLUENT_BOOTSTRAP_SERVERS}
+      - CONFLUENT_API_KEY=${CONFLUENT_API_KEY}
+      - CONFLUENT_API_SECRET=${CONFLUENT_API_SECRET}
+      - CONFLUENT_SR_URL=${CONFLUENT_SR_URL}
+      - CONFLUENT_SR_API_KEY=${CONFLUENT_SR_API_KEY}
+      - CONFLUENT_SR_API_SECRET=${CONFLUENT_SR_API_SECRET}
+      - CONFLUENT_SR_CLUSTER_ID=${CONFLUENT_SR_CLUSTER_ID}
+      - SOURCE_TOPIC=${SOURCE_TOPIC:-raw-messages}
+      - SINK_TOPIC_PII=${SINK_TOPIC_PII:-classified-pii}
+      - SINK_TOPIC_MEDIUM=${SINK_TOPIC_MEDIUM:-classified-medium}
+      - SINK_TOPIC_SAFE=${SINK_TOPIC_SAFE:-classified-safe}
+      - SINK_TOPIC_AUDIT=${SINK_TOPIC_AUDIT:-classification-audit}
+      - CONSUMER_GROUP=${CONSUMER_GROUP:-auto-data-classifier}
+      - CLASSIFIER_URL=http://classifier:8000
+    restart: unless-stopped
+
+volumes:
+  huggingface-cache:
