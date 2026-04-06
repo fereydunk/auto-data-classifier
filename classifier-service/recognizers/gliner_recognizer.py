@@ -10,13 +10,13 @@ from presidio_analyzer.nlp_engine import NlpArtifacts
 # GLiNER natural-language label → Presidio entity type
 #
 # GLiNER is a zero-shot NER model: labels are plain English phrases.
-# Grouped by DataCategory for readability — adding new verticals means
+# Grouped by DataTag for readability — adding new verticals means
 # appending entries here and registering the entity type in taxonomy.py.
 # ---------------------------------------------------------------------------
 # fmt: off
 GLINER_ENTITY_MAP: dict[str, str] = {
 
-    # ── PII — universal ─────────────────────────────────────────────────────
+    # ── PII — personal identifiers ───────────────────────────────────────────
     "person":                               "PERSON",
     "full name":                            "PERSON",
     "first name":                           "PERSON",
@@ -24,20 +24,8 @@ GLINER_ENTITY_MAP: dict[str, str] = {
     "email address":                        "EMAIL_ADDRESS",
     "phone number":                         "PHONE_NUMBER",
     "mobile number":                        "PHONE_NUMBER",
-    "home address":                         "LOCATION",
-    "street address":                       "LOCATION",
-    "mailing address":                      "LOCATION",
     "date of birth":                        "DATE_TIME",
     "birthday":                             "DATE_TIME",
-    "social security number":               "US_SSN",
-    "ssn":                                  "US_SSN",
-    "national insurance number":            "NIN",
-    "social insurance number":              "SIN",
-    "tax file number":                      "AU_TFN",
-    "passport number":                      "PASSPORT",
-    "driver's license":                     "DRIVER_LICENSE",
-    "driver license number":                "DRIVER_LICENSE",
-    "ip address":                           "IP_ADDRESS",
     "gender":                               "GENDER",
     "nationality":                          "NATIONALITY",
     "religion":                             "RELIGION",
@@ -48,24 +36,28 @@ GLINER_ENTITY_MAP: dict[str, str] = {
     "employee number":                      "EMPLOYEE_ID",
     "customer id":                          "CUSTOMER_ID",
     "member id":                            "CUSTOMER_ID",
-    "tax id":                               "US_ITIN",
+
+    # ── GOVERNMENT_ID — government-issued identifiers ────────────────────────
+    "social security number":               "US_SSN",
+    "ssn":                                  "US_SSN",
+    "national insurance number":            "NIN",
+    "social insurance number":              "SIN",
+    "tax file number":                      "AU_TFN",
     "individual taxpayer identification":   "US_ITIN",
+    "tax id":                               "US_ITIN",
+    "passport number":                      "PASSPORT",
+    "driver's license":                     "DRIVER_LICENSE",
+    "driver license number":                "DRIVER_LICENSE",
 
-    # ── PCI — payment / financial accounts ──────────────────────────────────
-    "credit card number":                   "CREDIT_CARD",
-    "debit card number":                    "CREDIT_CARD",
-    "payment card number":                  "CREDIT_CARD",
-    "bank account number":                  "BANK_ACCOUNT",
-    "iban":                                 "IBAN_CODE",
-    "swift code":                           "SWIFT_CODE",
-    "bic code":                             "SWIFT_CODE",
-    "routing number":                       "US_BANK_ROUTING",
-    "aba routing number":                   "US_BANK_ROUTING",
-    "cryptocurrency wallet":                "CRYPTO_WALLET",
-    "bitcoin address":                      "CRYPTO_WALLET",
-    "ethereum address":                     "CRYPTO_WALLET",
+    # ── LOCATION — geolocation and network identifiers ───────────────────────
+    "home address":                         "LOCATION",
+    "street address":                       "LOCATION",
+    "mailing address":                      "LOCATION",
+    "gps coordinates":                      "LOCATION",
+    "geolocation":                          "LOCATION",
+    "ip address":                           "IP_ADDRESS",
 
-    # ── PHI — healthcare ────────────────────────────────────────────────────
+    # ── PHI — protected health information ──────────────────────────────────
     "medical record number":                "MEDICAL_RECORD",
     "health insurance number":              "HEALTH_INSURANCE",
     "insurance member id":                  "HEALTH_INSURANCE",
@@ -76,15 +68,41 @@ GLINER_ENTITY_MAP: dict[str, str] = {
     "medication":                           "MEDICATION",
     "prescription":                         "MEDICATION",
     "drug name":                            "MEDICATION",
-    "npi number":                           "NPI",
-    "national provider identifier":         "NPI",
+    "national provider identifier":         "NATIONAL_PROVIDER_ID",
+    "npi number":                           "NATIONAL_PROVIDER_ID",
     "dea number":                           "DEA_NUMBER",
+
+    # ── BIOMETRIC ────────────────────────────────────────────────────────────
     "biometric data":                       "BIOMETRIC",
     "fingerprint":                          "BIOMETRIC",
     "facial recognition data":              "BIOMETRIC",
     "retinal scan":                         "BIOMETRIC",
+    "voice print":                          "BIOMETRIC",
 
-    # ── CREDENTIALS ─────────────────────────────────────────────────────────
+    # ── GENETIC ──────────────────────────────────────────────────────────────
+    "dna sequence":                         "GENETIC",
+    "genetic data":                         "GENETIC",
+    "genome":                               "GENETIC",
+    "genomic data":                         "GENETIC",
+    "genotype":                             "GENETIC",
+
+    # ── PCI — payment card network data ─────────────────────────────────────
+    "credit card number":                   "CREDIT_CARD",
+    "debit card number":                    "CREDIT_CARD",
+    "payment card number":                  "CREDIT_CARD",
+    "iban":                                 "IBAN_CODE",
+    "swift code":                           "SWIFT_CODE",
+    "bic code":                             "SWIFT_CODE",
+    "cryptocurrency wallet":                "CRYPTO_WALLET",
+    "bitcoin address":                      "CRYPTO_WALLET",
+    "ethereum address":                     "CRYPTO_WALLET",
+
+    # ── FINANCIAL — bank account and financial records ───────────────────────
+    "bank account number":                  "BANK_ACCOUNT",
+    "routing number":                       "US_BANK_ROUTING",
+    "aba routing number":                   "US_BANK_ROUTING",
+
+    # ── CREDENTIALS — authentication secrets ────────────────────────────────
     "password":                             "PASSWORD",
     "api key":                              "API_KEY",
     "secret key":                           "SECRET_KEY",
@@ -94,24 +112,22 @@ GLINER_ENTITY_MAP: dict[str, str] = {
     "connection string":                    "CONNECTION_STRING",
     "database password":                    "PASSWORD",
 
-    # ── CONFIDENTIAL — business ──────────────────────────────────────────────
-    "organization":                         "ORGANIZATION",
-    "company name":                         "ORGANIZATION",
-    "contract number":                      "CONTRACT_NUMBER",
-    "trade secret":                         "TRADE_SECRET",
+    # ── NPI — Non-Public Information (financial / securities) ────────────────
+    "insider information":                  "INSIDER_INFO",
+    "material non-public information":      "INSIDER_INFO",
+    "mnpi":                                 "INSIDER_INFO",
+    "earnings forecast":                    "EARNINGS_DATA",
+    "earnings before announcement":         "EARNINGS_DATA",
+    "pre-release earnings":                 "EARNINGS_DATA",
+    "merger information":                   "MERGER_ACQUISITION",
+    "acquisition data":                     "MERGER_ACQUISITION",
+    "m&a information":                      "MERGER_ACQUISITION",
 
-    # ── INTERNAL — operational ───────────────────────────────────────────────
-    "order number":                         "ORDER_NUMBER",
-    "order id":                             "ORDER_NUMBER",
-    "loyalty card number":                  "LOYALTY_CARD",
-    "rewards card number":                  "LOYALTY_CARD",
-    "license plate":                        "LICENSE_PLATE",
-    "vehicle identification number":        "VEHICLE_ID",
-    "vin":                                  "VEHICLE_ID",
-    "product id":                           "PRODUCT_ID",
-    "sku":                                  "PRODUCT_ID",
-    "shipment id":                          "SHIPMENT_ID",
-    "tracking number":                      "SHIPMENT_ID",
+    # ── MINOR — data relating to children ────────────────────────────────────
+    "child's data":                         "MINOR_DATA",
+    "minor's information":                  "MINOR_DATA",
+    "children's data":                      "MINOR_DATA",
+    "data about a minor":                   "MINOR_DATA",
 }
 # fmt: on
 

@@ -7,18 +7,18 @@ that processes patient or health-related data.
 from presidio_analyzer import Pattern, PatternRecognizer
 
 
-class NPIRecognizer(PatternRecognizer):
-    """US National Provider Identifier — 10-digit number."""
+class NationalProviderIDRecognizer(PatternRecognizer):
+    """US National Provider Identifier — 10-digit number starting with 1 or 2."""
     PATTERNS = [
         Pattern(
-            name="NPI",
+            name="NATIONAL_PROVIDER_ID",
             regex=r"\b[12][0-9]{9}\b",
             score=0.55,  # 10-digit numbers are common; GLiNER context raises this
         )
     ]
 
     def __init__(self):
-        super().__init__(supported_entity="NPI", patterns=self.PATTERNS)
+        super().__init__(supported_entity="NATIONAL_PROVIDER_ID", patterns=self.PATTERNS)
 
 
 class DEANumberRecognizer(PatternRecognizer):
@@ -59,7 +59,7 @@ class HealthInsuranceRecognizer(PatternRecognizer):
 
 def get_phi_recognizers():
     return [
-        NPIRecognizer(),
+        NationalProviderIDRecognizer(),
         DEANumberRecognizer(),
         HealthInsuranceRecognizer(),
     ]

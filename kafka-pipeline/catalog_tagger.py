@@ -30,65 +30,37 @@ SR_FIELD_TYPE = "sr_field"
 # ---------------------------------------------------------------------------
 # Category tag definitions — one per DataCategory
 # ---------------------------------------------------------------------------
+def _tag_def(name: str, description: str) -> dict:
+    return {
+        "name": name,
+        "entityTypes": [SR_FIELD_TYPE],
+        "description": description,
+        "attributeDefs": [
+            {"name": "entity_types",  "typeName": "string", "isOptional": True},
+            {"name": "classified_by", "typeName": "string", "isOptional": True},
+        ],
+    }
+
+
 TAG_DEFINITIONS = [
-    {
-        "name": "PII",
-        "entityTypes": [SR_FIELD_TYPE],
-        "description": "Personally Identifiable Information — name, email, SSN, passport, etc.",
-        "attributeDefs": [
-            {"name": "entity_types",   "typeName": "string", "isOptional": True},
-            {"name": "classified_by",  "typeName": "string", "isOptional": True},
-        ],
-    },
-    {
-        "name": "PHI",
-        "entityTypes": [SR_FIELD_TYPE],
-        "description": "Protected Health Information — medical records, diagnoses, medications.",
-        "attributeDefs": [
-            {"name": "entity_types",   "typeName": "string", "isOptional": True},
-            {"name": "classified_by",  "typeName": "string", "isOptional": True},
-        ],
-    },
-    {
-        "name": "PCI",
-        "entityTypes": [SR_FIELD_TYPE],
-        "description": "Payment Card Industry data — credit cards, bank accounts, IBAN, crypto wallets.",
-        "attributeDefs": [
-            {"name": "entity_types",   "typeName": "string", "isOptional": True},
-            {"name": "classified_by",  "typeName": "string", "isOptional": True},
-        ],
-    },
-    {
-        "name": "CREDENTIALS",
-        "entityTypes": [SR_FIELD_TYPE],
-        "description": "Authentication credentials — passwords, API keys, tokens, connection strings.",
-        "attributeDefs": [
-            {"name": "entity_types",   "typeName": "string", "isOptional": True},
-            {"name": "classified_by",  "typeName": "string", "isOptional": True},
-        ],
-    },
-    {
-        "name": "CONFIDENTIAL",
-        "entityTypes": [SR_FIELD_TYPE],
-        "description": "Confidential business data — contracts, trade secrets, strategy.",
-        "attributeDefs": [
-            {"name": "entity_types",   "typeName": "string", "isOptional": True},
-            {"name": "classified_by",  "typeName": "string", "isOptional": True},
-        ],
-    },
-    {
-        "name": "INTERNAL",
-        "entityTypes": [SR_FIELD_TYPE],
-        "description": "Internal operational data — order IDs, loyalty cards, shipment tracking.",
-        "attributeDefs": [
-            {"name": "entity_types",   "typeName": "string", "isOptional": True},
-            {"name": "classified_by",  "typeName": "string", "isOptional": True},
-        ],
-    },
+    _tag_def("PII",           "Personally Identifiable Information — name, email, phone, date of birth."),
+    _tag_def("PHI",           "Protected Health Information — medical records, diagnoses, medications, NPI/DEA numbers."),
+    _tag_def("PCI",           "Payment Card data — credit/debit cards, IBAN, SWIFT codes, crypto wallets."),
+    _tag_def("CREDENTIALS",   "Authentication secrets — passwords, API keys, tokens, connection strings."),
+    _tag_def("FINANCIAL",     "Financial account data — bank account numbers, routing numbers."),
+    _tag_def("GOVERNMENT_ID", "Government-issued identifiers — SSN, passport, driver's licence, national tax IDs."),
+    _tag_def("BIOMETRIC",     "Biometric identifiers — fingerprints, facial geometry, retina scans, voice prints."),
+    _tag_def("GENETIC",       "Genetic and genomic data — DNA sequences, genotypes, genome data."),
+    _tag_def("NPI",           "Non-Public Information — insider financials, pre-release earnings, M&A data."),
+    _tag_def("LOCATION",      "Precise geolocation and network identifiers — GPS coordinates, IP addresses."),
+    _tag_def("MINOR",         "Data relating to a person under 13 or 16 (COPPA / GDPR)."),
 ]
 
-# Category priority (highest wins when multiple categories on one field)
-_CATEGORY_PRIORITY = ["PHI", "CREDENTIALS", "PCI", "PII", "CONFIDENTIAL", "INTERNAL"]
+# Tag priority — highest wins when multiple tags detected on the same field
+_CATEGORY_PRIORITY = [
+    "PHI", "CREDENTIALS", "PCI", "FINANCIAL", "GOVERNMENT_ID",
+    "BIOMETRIC", "GENETIC", "NPI", "PII", "LOCATION", "MINOR",
+]
 
 
 def _field_qualified_name(sr_cluster_id: str, subject: str, version: int, field_path: str) -> str:
@@ -112,11 +84,11 @@ def extract_schema_id_from_wire(raw: bytes) -> Optional[int]:
 
 
 def _highest_category(categories: List[str]) -> str:
-    """Return the highest-priority category from a list."""
+    """Return the highest-priority tag from a list."""
     for cat in _CATEGORY_PRIORITY:
         if cat in categories:
             return cat
-    return "INTERNAL"
+    return "PII"
 
 
 class CatalogTagger:
@@ -291,8 +263,8 @@ class CatalogTagger:
 
             entity_types = [e["entity_type"] for e in entities]
             # Use category from classifier response if present; fall back to entity_type lookup
-            categories = [e.get("category", "INTERNAL") for e in entities]
-            tag = _highest_category(categories)
+            tags = [e.get("tag", "PII") for e in entities]
+            tag = _highest_category(tags)
 
             # Strip array indices (e.g. "items[0].name" → "items.name")
             clean_path = field_path.replace("[", ".").replace("]", "").strip(".")

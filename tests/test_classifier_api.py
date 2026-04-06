@@ -37,54 +37,58 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
         assert resp.json()["analyzer_ready"] is True
-        assert resp.json()["version"] == "2.0.0"
+        assert resp.json()["version"] == "3.0.0"
 
 
 class TestClassifyEndpoint:
-    def test_detects_ssn_as_pii_high(self, client):
+    def test_detects_ssn_as_government_id(self, client):
         client._mock_analyzer.analyze.return_value = [
             _make_result("US_SSN", 16, 27, score=0.97)
         ]
         resp = client.post("/classify", json={"fields": {"note": "SSN is 123-45-6789"}})
         assert resp.status_code == 200
         body = resp.json()
-        assert body["sensitivity_level"] == "HIGH"
-        assert "PII" in body["categories"]
+        assert "GOVERNMENT_ID" in body["tags"]
         assert "note" in body["detected_entities"]
         entity = body["detected_entities"]["note"][0]
         assert entity["entity_type"] == "US_SSN"
-        assert entity["category"] == "PII"
+        assert entity["tag"] == "GOVERNMENT_ID"
 
-    def test_detects_medical_record_as_phi_critical(self, client):
+    def test_detects_medical_record_as_phi(self, client):
         client._mock_analyzer.analyze.return_value = [
             _make_result("MEDICAL_RECORD", 0, 10, score=0.93)
         ]
         resp = client.post("/classify", json={"fields": {"id": "MRN-0012345"}})
         assert resp.status_code == 200
         body = resp.json()
-        assert body["sensitivity_level"] == "CRITICAL"
-        assert "PHI" in body["categories"]
-        assert body["detected_entities"]["id"][0]["category"] == "PHI"
+        assert "PHI" in body["tags"]
+        assert body["detected_entities"]["id"][0]["tag"] == "PHI"
 
-    def test_detects_password_as_credentials_critical(self, client):
+    def test_detects_password_as_credentials(self, client):
         client._mock_analyzer.analyze.return_value = [
             _make_result("PASSWORD", 0, 12, score=0.99)
         ]
         resp = client.post("/classify", json={"fields": {"config": "password=secret"}})
         assert resp.status_code == 200
-        assert resp.json()["sensitivity_level"] == "CRITICAL"
-        assert "CREDENTIALS" in resp.json()["categories"]
+        assert "CREDENTIALS" in resp.json()["tags"]
 
-    def test_clean_message_returns_clean(self, client):
+    def test_detects_bank_account_as_financial(self, client):
+        client._mock_analyzer.analyze.return_value = [
+            _make_result("BANK_ACCOUNT", 0, 10, score=0.6)
+        ]
+        resp = client.post("/classify", json={"fields": {"account": "1234567890"}})
+        assert resp.status_code == 200
+        assert "FINANCIAL" in resp.json()["tags"]
+
+    def test_clean_message_returns_empty_tags(self, client):
         client._mock_analyzer.analyze.return_value = []
         resp = client.post("/classify", json={"fields": {"status": "approved"}})
         assert resp.status_code == 200
         body = resp.json()
-        assert body["sensitivity_level"] == "CLEAN"
-        assert body["categories"] == []
+        assert body["tags"] == []
         assert body["detected_entities"] == {}
 
-    def test_multiple_categories_returned(self, client):
+    def test_multiple_tags_returned(self, client):
         def side_effect(text, language):
             if "ssn" in text.lower():
                 return [_make_result("US_SSN", 0, 5)]
@@ -97,8 +101,7 @@ class TestClassifyEndpoint:
             "fields": {"note": "SSN here", "id": "MRN-123"}
         })
         body = resp.json()
-        assert body["sensitivity_level"] == "CRITICAL"
-        assert set(body["categories"]) == {"PII", "PHI"}
+        assert set(body["tags"]) == {"GOVERNMENT_ID", "PHI"}
 
     def test_nested_fields_are_flattened(self, client):
         client._mock_analyzer.analyze.return_value = []
@@ -112,7 +115,7 @@ class TestClassifyEndpoint:
         client._mock_analyzer.analyze.return_value = []
         resp = client.post("/classify", json={"fields": {"x": "y"}})
         body = resp.json()
-        assert body["classifier_version"] == "2.0.0"
+        assert body["classifier_version"] == "3.0.0"
         assert "classified_at" in body
 
     def test_numeric_field_is_stringified_and_analyzed(self, client):
@@ -125,4 +128,10 @@ class TestClassifyEndpoint:
         client._mock_analyzer.analyze.return_value = []
         resp = client.post("/classify", json={"fields": {}})
         assert resp.status_code == 200
-        assert resp.json()["sensitivity_level"] == "CLEAN"
+        assert resp.json()["tags"] == []
+
+    def test_no_sensitivity_level_in_response(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"x": "y"}})
+        assert "sensitivity_level" not in resp.json()
+        assert "categories" not in resp.json()

@@ -22,8 +22,7 @@ class Config:
 
     # Topics
     SOURCE_TOPIC: str = os.getenv("SOURCE_TOPIC", "raw-messages")
-    SINK_TOPIC_PII: str = os.getenv("SINK_TOPIC_PII", "classified-pii")
-    SINK_TOPIC_MEDIUM: str = os.getenv("SINK_TOPIC_MEDIUM", "classified-medium")
+    SINK_TOPIC_CLASSIFIED: str = os.getenv("SINK_TOPIC_CLASSIFIED", "classified-messages")
     SINK_TOPIC_SAFE: str = os.getenv("SINK_TOPIC_SAFE", "classified-safe")
     SINK_TOPIC_AUDIT: str = os.getenv("SINK_TOPIC_AUDIT", "classification-audit")
 

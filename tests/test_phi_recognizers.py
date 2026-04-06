@@ -3,25 +3,25 @@ Tests for PHI (Protected Health Information) regex recognizers.
 """
 import pytest
 from recognizers.phi_recognizers import (
-    NPIRecognizer,
+    NationalProviderIDRecognizer,
     DEANumberRecognizer,
     HealthInsuranceRecognizer,
     get_phi_recognizers,
 )
 
 
-class TestNPIRecognizer:
-    r = NPIRecognizer()
+class TestNationalProviderIDRecognizer:
+    r = NationalProviderIDRecognizer()
 
     @pytest.mark.parametrize("text", [
         "Provider NPI: 1234567890",
         "NPI 2000000001",
     ])
     def test_detects_npi(self, text):
-        assert self.r.analyze(text=text, entities=["NPI"])
+        assert self.r.analyze(text=text, entities=["NATIONAL_PROVIDER_ID"])
 
     def test_ignores_short_numbers(self):
-        assert not self.r.analyze(text="code 12345", entities=["NPI"])
+        assert not self.r.analyze(text="code 12345", entities=["NATIONAL_PROVIDER_ID"])
 
 
 class TestDEANumberRecognizer:

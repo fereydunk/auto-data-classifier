@@ -1,21 +1,15 @@
 """
 Tests for PCI (Payment Card Industry) regex recognizers.
-Renamed from test_banking_recognizers — these apply to any industry
-that handles payment data, not just banks.
+Covers payment card network data: IBAN, SWIFT, crypto wallets.
+Bank account and routing number tests are in test_financial_recognizers.py.
 """
 import pytest
 from recognizers.pci_recognizers import (
     IBANRecognizer,
     SwiftCodeRecognizer,
-    USRoutingNumberRecognizer,
-    BankAccountRecognizer,
     CryptoWalletRecognizer,
     get_pci_recognizers,
 )
-
-
-def _hits(recognizer, text):
-    return recognizer.analyze(text=text, entities=[recognizer.supported_entities[0]])
 
 
 class TestIBANRecognizer:
@@ -46,16 +40,6 @@ class TestSwiftCodeRecognizer:
         assert self.r.analyze(text=text, entities=["SWIFT_CODE"])
 
 
-class TestUSRoutingNumberRecognizer:
-    r = USRoutingNumberRecognizer()
-
-    @pytest.mark.parametrize("text", [
-        "Routing number: 021000021", "ABA 111000038",
-    ])
-    def test_detects_routing_numbers(self, text):
-        assert self.r.analyze(text=text, entities=["US_BANK_ROUTING"])
-
-
 class TestCryptoWalletRecognizer:
     r = CryptoWalletRecognizer()
 
@@ -68,8 +52,8 @@ class TestCryptoWalletRecognizer:
 
 
 class TestGetPCIRecognizers:
-    def test_returns_five(self):
-        assert len(get_pci_recognizers()) == 5
+    def test_returns_three(self):
+        assert len(get_pci_recognizers()) == 3
 
     def test_each_has_supported_entity(self):
         for r in get_pci_recognizers():

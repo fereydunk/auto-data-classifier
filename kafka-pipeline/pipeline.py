@@ -28,12 +28,6 @@ logger = logging.getLogger("pipeline")
 
 cfg = Config()
 
-TOPIC_BY_SENSITIVITY = {
-    "HIGH":   cfg.SINK_TOPIC_PII,
-    "MEDIUM": cfg.SINK_TOPIC_MEDIUM,
-    "LOW":    cfg.SINK_TOPIC_SAFE,
-    "CLEAN":  cfg.SINK_TOPIC_SAFE,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +100,13 @@ def route_message(
     classification: Dict[str, Any],
     source_key: Optional[bytes],
 ) -> None:
-    sensitivity = classification.get("sensitivity_level", "CLEAN")
-    sink_topic = TOPIC_BY_SENSITIVITY.get(sensitivity, cfg.SINK_TOPIC_SAFE)
+    tags = classification.get("tags", [])
+    sink_topic = cfg.SINK_TOPIC_CLASSIFIED if tags else cfg.SINK_TOPIC_SAFE
 
     enriched = {
         "payload": original_payload,
         "classification": {
-            "sensitivity_level": sensitivity,
+            "tags": tags,
             "detected_entities": classification.get("detected_entities", {}),
             "classified_at": classification.get("classified_at"),
             "classifier_version": classification.get("classifier_version"),
@@ -127,7 +121,7 @@ def route_message(
     )
 
     audit = {
-        "sensitivity_level": sensitivity,
+        "tags": tags,
         "sink_topic": sink_topic,
         "classified_at": classification.get("classified_at"),
         "entity_types_found": list(

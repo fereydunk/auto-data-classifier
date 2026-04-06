@@ -4,11 +4,13 @@ No Confluent Cloud connection required.
 """
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from catalog_tagger import CatalogTagger, _field_qualified_name, _highest_category
+from catalog_tagger import CatalogTagger, _field_qualified_name, _highest_category, TAG_DEFINITIONS
 
 
 SR_URL = "https://psrc-test.confluent.cloud"
 SR_CLUSTER_ID = "lsrc-test01"
+
+ALL_TAG_NAMES = [t["name"] for t in TAG_DEFINITIONS]
 
 
 def make_tagger() -> CatalogTagger:
@@ -64,7 +66,7 @@ class TestQualifiedName:
         assert "address.city" in qn
 
 
-class TestHighestCategory:
+class TestHighestTag:
     def test_phi_beats_pii(self):
         assert _highest_category(["PII", "PHI"]) == "PHI"
 
@@ -74,14 +76,32 @@ class TestHighestCategory:
     def test_phi_beats_credentials(self):
         assert _highest_category(["CREDENTIALS", "PHI"]) == "PHI"
 
-    def test_pci_beats_pii(self):
-        assert _highest_category(["PII", "PCI"]) == "PCI"
+    def test_pci_beats_financial(self):
+        assert _highest_category(["FINANCIAL", "PCI"]) == "PCI"
 
-    def test_single_category_returned(self):
-        assert _highest_category(["INTERNAL"]) == "INTERNAL"
+    def test_financial_beats_pii(self):
+        assert _highest_category(["PII", "FINANCIAL"]) == "FINANCIAL"
 
-    def test_empty_defaults_to_internal(self):
-        assert _highest_category([]) == "INTERNAL"
+    def test_government_id_beats_location(self):
+        assert _highest_category(["LOCATION", "GOVERNMENT_ID"]) == "GOVERNMENT_ID"
+
+    def test_single_tag_returned(self):
+        assert _highest_category(["MINOR"]) == "MINOR"
+
+    def test_empty_defaults_to_pii(self):
+        assert _highest_category([]) == "PII"
+
+
+class TestTagDefinitions:
+    def test_all_11_tags_defined(self):
+        assert len(TAG_DEFINITIONS) == 11
+
+    def test_tag_names(self):
+        expected = {
+            "PII", "PHI", "PCI", "CREDENTIALS", "FINANCIAL",
+            "GOVERNMENT_ID", "BIOMETRIC", "GENETIC", "NPI", "LOCATION", "MINOR",
+        }
+        assert set(ALL_TAG_NAMES) == expected
 
 
 class TestEnsureTagDefinitions:
@@ -95,8 +115,7 @@ class TestEnsureTagDefinitions:
     @pytest.mark.asyncio
     async def test_skips_if_all_exist(self):
         tagger = make_tagger()
-        all_tags = [{"name": t} for t in ["PII", "PHI", "PCI", "CREDENTIALS", "CONFIDENTIAL", "INTERNAL"]]
-        client = mock_client(tagdefs_get_body=all_tags)
+        client = mock_client(tagdefs_get_body=[{"name": n} for n in ALL_TAG_NAMES])
         await tagger.ensure_tag_definitions(client)
         assert not client.post.called
 
@@ -121,7 +140,7 @@ class TestApplyClassifications:
             topic="patients",
             detected_entities={
                 "patient.diagnosis": [
-                    {"entity_type": "MEDICAL_CONDITION", "category": "PHI", "score": 0.91}
+                    {"entity_type": "MEDICAL_CONDITION", "tag": "PHI", "score": 0.91}
                 ]
             },
             schema_id=10,
@@ -141,7 +160,7 @@ class TestApplyClassifications:
             topic="orders",
             detected_entities={
                 "customer.email": [
-                    {"entity_type": "EMAIL_ADDRESS", "category": "PII", "score": 0.95}
+                    {"entity_type": "EMAIL_ADDRESS", "tag": "PII", "score": 0.95}
                 ]
             },
             schema_id=5,
@@ -161,7 +180,7 @@ class TestApplyClassifications:
             topic="configs",
             detected_entities={
                 "db.password": [
-                    {"entity_type": "PASSWORD", "category": "CREDENTIALS", "score": 0.99}
+                    {"entity_type": "PASSWORD", "tag": "CREDENTIALS", "score": 0.99}
                 ]
             },
             schema_id=3,
@@ -169,6 +188,26 @@ class TestApplyClassifications:
 
         call_payload = client.post.call_args[1]["json"]
         assert call_payload[0]["classifications"][0]["typeName"] == "CREDENTIALS"
+
+    @pytest.mark.asyncio
+    async def test_government_id_field_tagged_correctly(self):
+        tagger = make_tagger()
+        tagger._tags_bootstrapped = True
+        client = mock_client(versions_body=[1], version_detail_body={"id": 8, "version": 1})
+
+        await tagger.apply_classifications(
+            client=client,
+            topic="users",
+            detected_entities={
+                "customer.ssn": [
+                    {"entity_type": "US_SSN", "tag": "GOVERNMENT_ID", "score": 0.97}
+                ]
+            },
+            schema_id=8,
+        )
+
+        call_payload = client.post.call_args[1]["json"]
+        assert call_payload[0]["classifications"][0]["typeName"] == "GOVERNMENT_ID"
 
     @pytest.mark.asyncio
     async def test_phi_wins_over_pii_on_same_field(self):
@@ -181,8 +220,8 @@ class TestApplyClassifications:
             topic="records",
             detected_entities={
                 "notes": [
-                    {"entity_type": "PERSON",            "category": "PII", "score": 0.90},
-                    {"entity_type": "MEDICAL_CONDITION", "category": "PHI", "score": 0.88},
+                    {"entity_type": "PERSON",            "tag": "PII", "score": 0.90},
+                    {"entity_type": "MEDICAL_CONDITION", "tag": "PHI", "score": 0.88},
                 ]
             },
             schema_id=7,
@@ -204,7 +243,7 @@ class TestApplyClassifications:
         tagger = make_tagger()
         tagger._tags_bootstrapped = True
         client = mock_client(versions_body=[1], version_detail_body={"id": 7, "version": 1})
-        entities = {"customer.ssn": [{"entity_type": "US_SSN", "category": "PII", "score": 0.97}]}
+        entities = {"customer.ssn": [{"entity_type": "US_SSN", "tag": "GOVERNMENT_ID", "score": 0.97}]}
 
         await tagger.apply_classifications(client=client, topic="payments", detected_entities=entities, schema_id=7)
         first_count = client.post.call_count
@@ -223,7 +262,7 @@ class TestApplyClassifications:
 
         await tagger.apply_classifications(
             client=client, topic="payments",
-            detected_entities={"account.number": [{"entity_type": "BANK_ACCOUNT", "category": "PCI", "score": 0.8}]},
+            detected_entities={"account.number": [{"entity_type": "BANK_ACCOUNT", "tag": "FINANCIAL", "score": 0.8}]},
             schema_id=3,
         )
         assert len(tagger._tagged) == 1
