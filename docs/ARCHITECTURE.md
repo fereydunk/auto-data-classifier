@@ -329,3 +329,32 @@ kafka-pipeline          classifier-service      review-api          Stream Catal
       │                        │                    │── approve ─────────▶│
       │                        │                    │◀── 200 OK ──────────│
 ```
+
+---
+
+## Future considerations
+
+### Layer 1.5 — Structural fingerprinting (no plaintext access)
+
+A potential intermediate layer between Layer 1 (field name) and Layer 2 (Presidio regex) that detects sensitive data based on the **shape and statistics** of values rather than reading their content:
+
+**Structural pattern fingerprinting**
+- Analyse character-class structure of values (`3-2-4` digit groups → likely SSN/phone, `*@*.*` → likely email, 16 digits in groups of 4 → likely credit card) without reading plaintext
+- Value length distribution, entropy, and character-set cardinality — high entropy + fixed length suggests a token or credential; all-numeric 9-char values suggest SSN or zip
+
+**MinHash / reference PII hashing (customer opt-in)**
+- Customer pre-hashes a reference set of known PII (employee emails, SSNs, etc.)
+- At classification time incoming values are hashed and compared — zero plaintext exposure, high precision for known data
+- Useful for detecting data leakage ("is our HR dataset appearing in this Kafka topic?")
+- Limitation: only detects data in the reference set; novel PII (a new person's email) is missed
+
+**Where it would sit**
+
+```
+Layer 1   — field name only          (zero data access, <1ms)
+Layer 1.5 — structural fingerprint   (shape/entropy/minhash, no plaintext)
+Layer 2   — Presidio regex           (reads plaintext values, 5–20ms)
+Layer 3   — spaCy + GLiNER AI        (reads plaintext, NLP, 50–500ms)
+```
+
+The structural fingerprinting variant overlaps with what Presidio already does in Layer 2 but could be run in environments where plaintext data must not leave the customer's perimeter. The reference hashing variant is a premium, customer opt-in feature that would require a secure key-management workflow for the hash seeds.
