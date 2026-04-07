@@ -12,7 +12,7 @@ import httpx
 logger = logging.getLogger("catalog_client")
 
 SR_FIELD_TYPE = "sr_field"
-CLASSIFIER_VERSION = "3.0.0"
+CLASSIFIER_VERSION = "3.1.0"
 
 
 def _field_qualified_name(sr_cluster_id: str, subject: str, version: int, field_path: str) -> str:

@@ -25,6 +25,8 @@ General-purpose personal data not covered by a more specific tag.
 | `CUSTOMER_ID` | Client ID, account holder ID |
 | `GENDER` | Gender, sex |
 | `NATIONALITY` | Citizenship, nationality |
+| `RELIGION` | Religious affiliation |
+| `RACE_ETHNICITY` | Race, ethnicity |
 
 Field name signals: `email`, `phone_number`, `first_name`, `last_name`, `date_of_birth`, `dob`, `gender`, `username`
 
@@ -183,6 +185,8 @@ ENTITY_TAG = {
     "CUSTOMER_ID":     DataTag.PII,
     "GENDER":          DataTag.PII,
     "NATIONALITY":     DataTag.PII,
+    "RELIGION":        DataTag.PII,
+    "RACE_ETHNICITY":  DataTag.PII,
 
     # PHI
     "MEDICAL_RECORD":      DataTag.PHI,

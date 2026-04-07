@@ -1,17 +1,21 @@
 """
 Confluent Stream Catalog field tagger.
 
-After classification, applies data category tags directly to schema fields
-in the Confluent Stream Catalog, so data stewards get meaningful, actionable
-labels — not just high/medium/low buckets.
+After classification, applies data tags directly to schema fields in the
+Confluent Stream Catalog so data stewards get meaningful, actionable labels.
 
-Tags applied per field (one tag per field, highest category wins):
-  PHI         → Protected Health Information
-  CREDENTIALS → Passwords, tokens, API keys
-  PII         → Personally Identifiable Information
-  PCI         → Payment Card / financial account data
-  CONFIDENTIAL → Business-confidential data
-  INTERNAL    → Internal operational data
+Tags applied per field (one tag per field, highest-priority tag wins):
+  PHI           → Protected Health Information
+  CREDENTIALS   → Passwords, tokens, API keys
+  PCI           → Payment Card / financial account data
+  FINANCIAL     → Bank accounts, routing numbers
+  GOVERNMENT_ID → SSN, passport, driver's licence, national IDs
+  BIOMETRIC     → Fingerprints, facial geometry, retina scans
+  GENETIC       → DNA sequences, genomic data
+  NPI           → Non-Public Information — insider financials, M&A data
+  PII           → Personally Identifiable Information
+  LOCATION      → GPS coordinates, IP addresses
+  MINOR         → Data relating to a person under 13 or 16
 
 All operations are idempotent — safe to call on every message.
 A local cache prevents redundant API calls for already-tagged fields.

@@ -22,7 +22,7 @@ FREE_TEXT_FIELD_NAMES = {
     "messages", "body", "text", "content", "details", "remark",
     "remarks", "feedback", "review", "narrative", "summary", "observation",
     "reason", "response", "log", "annotation", "memo", "transcript",
-    "freetext", "freetext", "opentext", "narrativetext",
+    "freetext", "opentext", "narrativetext",
 }
 
 FREE_TEXT_VALUE_MIN_WORDS = 6   # values with this many words are treated as free-text
