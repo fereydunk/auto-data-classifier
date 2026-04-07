@@ -1,152 +1,285 @@
 # Architecture
 
-## Component overview
+## Overview
+
+The auto data classifier has two operating modes that share the same classification engine:
+
+1. **Streaming pipeline** — continuously classifies every message on a Kafka topic
+2. **Flink SQL scanner** — on-demand interactive profiling with human approval in the Flink workspace
+
+Both modes use the same three-layer classifier and write tags to the same Confluent Stream Catalog.
+
+---
+
+## Component map
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Confluent Cloud                              │
-│                                                                     │
-│  ┌──────────────┐    ┌─────────────────┐    ┌──────────────────┐   │
-│  │ Source topic  │    │  Flink SQL       │    │ Output topics    │   │
-│  │ (raw-messages)│───►│  routing.sql     │    │ classified-pii   │   │
-│  └──────────────┘    │  (optional post- │    │ classified-medium │   │
-│                       │   processing)    │    │ classified-safe   │   │
-│  ┌──────────────┐    └─────────────────┘    │ classification-   │   │
-│  │ Schema        │                           │   audit           │   │
-│  │ Registry      │    ┌─────────────────┐    └──────────────────┘   │
-│  │ (Avro schemas)│    │  Stream Catalog  │                          │
-│  └──────────────┘    │  (field tags)    │                          │
-│                       └─────────────────┘                          │
-└──────────────────────────────┬──────────────────────────────────────┘
-                                │  SASL/TLS (Kafka + SR REST API)
-                                │
-┌──────────────────────────────▼──────────────────────────────────────┐
-│                      Your Compute (VM / K8s)                        │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  kafka-pipeline  (pipeline.py)                              │   │
-│  │                                                             │   │
-│  │  Consumer ──► Avro deserializer ──► classify() ──► Producer │   │
-│  │                     │                   │                   │   │
-│  │          Schema Registry           catalog_tagger           │   │
-│  │          (schema ID → fields)      (field tags → SR)        │   │
-│  └──────────────────────────┬────────────────────────────────┘    │
-│                              │  HTTP (localhost)                    │
-│  ┌───────────────────────────▼────────────────────────────────┐    │
-│  │  classifier-service  (main.py)                             │    │
-│  │                                                            │    │
-│  │  POST /classify                                            │    │
-│  │    ├─ flatten_fields()                                     │    │
-│  │    ├─ AnalyzerEngine.analyze() per field                   │    │
-│  │    │    ├─ Presidio built-in (email, phone, SSN, CC …)     │    │
-│  │    │    ├─ PCI recognizers  (IBAN, SWIFT, routing …)       │    │
-│  │    │    ├─ PHI recognizers  (NPI, DEA, insurance ID …)     │    │
-│  │    │    ├─ Credentials     (AWS key, JWT, conn string …)   │    │
-│  │    │    └─ GLiNER NER      (names, diagnoses, free text …) │    │
-│  │    └─ taxonomy: entity → category → sensitivity            │    │
-│  └────────────────────────────────────────────────────────────┘    │
-│                  (all model files local — zero egress)              │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Confluent Cloud                                  │
+│                                                                         │
+│  Kafka Topics                        Stream Catalog (Schema Registry)   │
+│  ┌──────────────────┐                ┌────────────────────────────────┐ │
+│  │ raw-messages     │                │ payments-value                 │ │
+│  │ classified-msgs  │                │   customer.email  → PII        │ │
+│  │ classified-safe  │                │   card.number     → PCI        │ │
+│  │ classification-  │                │   patient_id      → PHI        │ │
+│  │   audit          │                └────────────────────────────────┘ │
+│  └──────────────────┘                                                   │
+│          │                  Flink SQL Workspace                         │
+│          │                  ┌──────────────────────────────────────┐    │
+│          │                  │  classify_fields() UDTF              │    │
+│          │                  │  apply_tag() scalar UDF              │    │
+│          │                  │  sql/scan.sql template               │    │
+│          │                  └──────────────────────────────────────┘    │
+└──────────┼──────────────────────────────────────────────────────────────┘
+           │
+           ▼ (your compute — local or cloud VM)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  kafka-pipeline                   review-api (:8001)                   │
+│  ┌──────────────────────────┐     ┌──────────────────────────────────┐  │
+│  │ consumer.poll()          │     │ POST /recommendations (upsert)   │  │
+│  │ deserialize (Avro/JSON)  │────▶│ GET  /recommendations            │  │
+│  │ POST /classify           │     │ POST /recommendations/bulk-      │  │
+│  │ route_message()          │     │       approve                    │  │
+│  │ post_recommendations()   │     │ POST /recommendations/{id}/      │  │
+│  └──────────────────────────┘     │       approve | reject           │  │
+│                                   │ → catalog_client.apply_tag()     │  │
+│                                   └──────────────────────────────────┘  │
+│                                                                         │
+│  classifier-service (:8000)                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  POST /classify                                                   │  │
+│  │                                                                   │  │
+│  │  Layer 1 ── field_name_recognizer.py                             │  │
+│  │             Consecutive token matching on field name              │  │
+│  │             Zero data access — instant, deterministic             │  │
+│  │                                                                   │  │
+│  │  Layer 2 ── Presidio AnalyzerEngine (regex only)                 │  │
+│  │             build_regex_analyzer() — no NLP engine               │  │
+│  │             Built-in + custom: PHI, PCI, FINANCIAL, CREDENTIALS  │  │
+│  │                                                                   │  │
+│  │  Layer 3 ── Presidio AnalyzerEngine (spaCy + GLiNER)             │  │
+│  │             build_ai_analyzer() — en_core_web_lg + GLiNER        │  │
+│  │             Handles free-text: comment, notes, description …     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Data flow
+---
 
-### Per-message flow
+## Streaming pipeline — detailed flow
 
-```
-1. Consumer polls source topic
-2. Raw bytes inspected for Confluent magic byte (0x00)
-   ├─ Wire format → AvroDeserializer (schema from Registry)
-   └─ Plain bytes → JSON.parse fallback
-3. POST /classify  {"fields": {flattened message dict}}
-4. Classifier iterates over leaf fields:
-   a. analyzer.analyze(text, language="en")
-   b. Results: list of RecognizerResult (entity_type, start, end, score)
-   c. categorize_entity(entity_type) → DataCategory
-5. sensitivity_for_categories({all categories}) → SensitivityLevel
-6. Response: {sensitivity_level, categories, detected_entities}
-7. Pipeline routes enriched message to output topic by sensitivity
-8. Audit record always written to classification-audit
-9. catalog_tagger.apply_classifications() — async, best-effort
-   a. Resolve subject = "{topic}-value"
-   b. Resolve schema version from schema_id or /versions/latest
-   c. For each detected field: POST /catalog/v1/entity/tags
-      with tag = highest DataCategory for that field
-```
-
-### Catalog tagging (async, per-field)
+### Message lifecycle
 
 ```
-field: "patient.diagnosis"
-entities: [MEDICAL_CONDITION (PHI)]
+1. Consumer polls raw-messages topic (Confluent Cloud)
+2. Deserialize:
+     Confluent wire format → AvroDeserializer → dict
+     Plain bytes           → json.loads()      → dict
+3. Flatten nested fields (recursive)
+     {"customer": {"email": "..."}}  →  {"customer.email": "..."}
+4. POST /classify with {fields, max_layer}
+5. Response contains tags[] and detected_entities{field_path: [entity…]}
+6. route_message():
+     tags non-empty → classified-messages topic (enriched payload)
+     tags empty     → classified-safe topic
+     always         → classification-audit topic
+7. post_recommendations():
+     For each (field, tag) pair → POST /recommendations
+     Upsert: keeps highest-confidence entity for same (topic, field, tag)
+8. consumer.commit() — manual offset commit after batch
+```
 
-_highest_category(["PHI"]) → "PHI"
+### Classification response shape
 
-POST /catalog/v1/entity/tags
+```json
 {
-  "typeName": "sr_field",
-  "attributes": {"qualifiedName": "lsrc-xxx:.:patients-value.v1.patient.diagnosis"},
-  "classifications": [{"typeName": "PHI", "attributes": {...}}]
+  "tags": ["PII", "PCI"],
+  "detected_entities": {
+    "customer.email": [
+      {
+        "entity_type": "EMAIL_ADDRESS",
+        "tag": "PII",
+        "score": 0.97,
+        "start": 0, "end": 17,
+        "text_snippet": "alice@example.com",
+        "layer": 1,
+        "source": "field_name"
+      }
+    ],
+    "card.number": [
+      {
+        "entity_type": "CREDIT_CARD",
+        "tag": "PCI",
+        "score": 0.99,
+        "layer": 2,
+        "source": "regex"
+      }
+    ]
+  },
+  "layers_used": [1, 2, 3],
+  "classified_at": "2026-04-06T10:00:00+00:00",
+  "classifier_version": "3.1.0"
 }
 ```
 
-Tagging is **idempotent** — 409 responses are treated as success. An in-process set prevents re-tagging the same (subject, version, field, tag) within a process lifetime.
+---
 
-## Classifier service internals
+## Flink SQL scanner — detailed flow
 
-### Recognition layers (fast → slow)
+```
+Operator opens Confluent Cloud Flink SQL workspace
+        │
+        ▼
+Statement A — sample + classify
+┌────────────────────────────────────────────────────────────────┐
+│ SELECT field_path, tag, MAX(score), MIN(layer), ANY_VALUE(...) │
+│ FROM `payments`,                                               │
+│      LATERAL TABLE(classify_fields(url, max_layer, $value))    │
+│ WHERE $rowtime >= CURRENT_TIMESTAMP - INTERVAL '2' MINUTES     │
+│ GROUP BY field_path, tag                                       │
+│ ORDER BY confidence DESC                                       │
+└────────────────────────────────────────────────────────────────┘
+        │
+        ▼  (results accumulate in Flink results pane)
 
-| Layer | Recognizers | Latency | Strength |
-|---|---|---|---|
-| Regex (Presidio built-in) | Email, phone, SSN, credit card, IP | <1ms | Structural PII, high precision |
-| Regex (custom) | IBAN, SWIFT, routing, JWT, AWS key, NPI, DEA | <1ms | Domain-specific structural patterns |
-| spaCy NER | PERSON, LOCATION, ORGANIZATION, DATE_TIME | 5–20ms | Named entities in English text |
-| GLiNER NER | 90+ custom labels across all categories | 10–50ms | Contextual, zero-shot, extensible |
+  field_path          tag       confidence  layer  source
+  ──────────────────────────────────────────────────────
+  customer.email      PII       0.97        1      field_name
+  card.number         PCI       0.99        2      regex
+  notes               PII       0.74        3      ai_model
 
-### Taxonomy design decisions
+        │  (operator stops query after N minutes, reviews table)
+        ▼
+Statement B — approve + apply
+┌────────────────────────────────────────────────────────────────┐
+│ SELECT apply_tag(sr_url, key, secret, cluster_id,             │
+│                  subject, field_path, tag) AS result           │
+│ FROM (VALUES                                                   │
+│   ('payments-value', 'customer.email', 'PII'),                │
+│   ('payments-value', 'card.number',    'PCI')                  │
+│ ) AS approvals(subject, field_path, tag)                      │
+└────────────────────────────────────────────────────────────────┘
+        │
+        ▼  apply_tag() calls:
+           1. GET  {SR_URL}/subjects/{subject}/versions/latest  → version
+           2. POST {SR_URL}/catalog/v1/entity/tags              → tag applied
 
-**Why separate DataCategory from SensitivityLevel?**
-A field with `ORGANIZATION` (CONFIDENTIAL → MEDIUM) and `CREDIT_CARD` (PCI → HIGH) should be tagged as `PCI` in the catalog, not as `SENSITIVE`. The category is the meaningful business label; the sensitivity level is the operational urgency.
-
-**Why does PHI → CRITICAL but PCI → HIGH?**
-HIPAA penalties are significantly more severe than PCI DSS for equivalent breaches. Healthcare data also carries ethical obligations beyond regulatory compliance.
-
-**Why does GLiNER run on every free-text field?**
-GLiNER is zero-shot — it classifies against all 90+ labels in a single forward pass. Adding new entity types does not require model retraining or a new inference call.
-
-## Schema Registry integration
-
-### Deserialization
-
-```python
-# Wire format detection
-if raw[0] == 0x00:
-    schema_id = struct.unpack(">bI", raw[:5])[1]  # bytes 1–4
-    payload = AvroDeserializer(sr_client)(raw, ctx)
-else:
-    payload = json.loads(raw)  # JSON fallback
+        Result column shows: "OK: PII → payments-value.customer.email"
 ```
 
-The schema ID from the wire format is passed to the catalog tagger to tag the exact schema version that was observed in production — not just the latest version.
+The two UDFs (`ClassifyFieldsUDF`, `ApplyTagUDF`) are packaged as a single fat JAR and registered once per Flink environment.
 
-### Stream Catalog qualified names
+---
 
-Confluent Stream Catalog identifies schema fields by qualified name:
+## Review API — recommendation lifecycle
+
+```
+State machine per (topic, field_path, proposed_tag):
+
+  PENDING ──── approve ──▶ APPROVED ──▶ tag applied in Stream Catalog
+     │
+     └───────── reject ──▶ REJECTED
+
+Upsert rule: if a new recommendation arrives for an existing (topic, field, tag)
+with a higher confidence score, the existing record is updated and status
+reset to PENDING.
+
+Confidence tiers (for display in the review UI):
+  HIGH   ≥ 0.85  — safe to bulk-approve
+  MEDIUM  0.60–0.84  — review individually
+  LOW    < 0.60  — inspect the example snippet before approving
+```
+
+### Key endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/recommendations` | Upsert from pipeline (idempotent) |
+| `GET` | `/recommendations` | List all, filter by status/topic/tag/tier |
+| `GET` | `/recommendations/summary` | Counts by topic |
+| `POST` | `/recommendations/bulk-approve` | Approve all ≥ min_confidence (default 0.85) |
+| `POST` | `/recommendations/{id}/approve` | Approve one → apply tag |
+| `POST` | `/recommendations/{id}/reject` | Reject one |
+
+---
+
+## Three-layer engine — decision logic
+
+```python
+for field_path, value in flat_fields.items():
+    leaf = _leaf_name(field_path)           # "customer.email" → "email"
+    free_text = is_free_text(leaf, value)   # known name OR word count ≥ 6
+
+    # Layer 1 — always runs
+    for match in classify_field_name(leaf):
+        emit(layer=1, source="field_name", ...)
+
+    # Layer 2 — runs if max_layer >= 2
+    if max_layer >= 2:
+        for r in regex_analyzer.analyze(value):
+            emit(layer=2, source="regex", ...)
+
+    # Layer 3 — runs if max_layer >= 3
+    if max_layer >= 3:
+        for r in ai_analyzer.analyze(value):
+            emit(layer=3, source="ai_model", ...)
+```
+
+All enabled layers always run. There is no early-exit on a match — a field can have results from all three layers simultaneously. The review API and Flink scanner deduplicate by keeping the highest-confidence entity per `(field, tag)` pair.
+
+### Free-text field detection
+
+Fields named `comment`, `notes`, `description`, `message`, `feedback`, etc. are flagged as free-text regardless of value. Fields with a generic name but a value containing ≥ 6 words are also flagged. Free-text fields are always sent through Layer 3 (AI) when `max_layer >= 3`.
+
+### Field name matching algorithm
+
+Layer 1 uses **consecutive token subsequence matching**:
+- The field name is tokenized: `creditCardNumber` → `["credit", "card", "number"]`
+- Each keyword is also tokenized: `credit_card` → `["credit", "card"]`
+- Match if keyword tokens appear as a contiguous run in field tokens
+- This prevents `id` from matching `patient_id` while allowing `credit_card_number` to match `credit_card`
+
+---
+
+## Stream Catalog — tag application
+
+Tags are applied to Schema Registry field entities. The Confluent Stream Catalog qualified name format is:
 
 ```
 {sr_cluster_id}:.:{subject}.v{version}.{field_path}
 
 Example:
-lsrc-abc123:.:payments-value.v3.customer.email
+lsrc-abc123:.:.payments-value.v3.customer.email
 ```
 
-`sr_cluster_id` is the `lsrc-xxx` value from Confluent Console → Schema Registry → Cluster settings.
+Tag definitions are bootstrapped once on first run (idempotent `POST /catalog/v1/types/tagdefs`). Tag application is idempotent — HTTP 409 (already tagged) is treated as success.
 
-## Scaling considerations
+---
 
-| Bottleneck | Mitigation |
-|---|---|
-| GLiNER CPU inference | Run multiple classifier replicas behind a load balancer; use `MAX_CONCURRENT` env var to control pipeline concurrency |
-| Catalog API rate limits | In-process cache (`_tagged` set) eliminates redundant calls; same field is only tagged once per process lifetime |
-| Schema version resolution | O(n) version scan per schema_id; acceptable for low schema churn; add Redis caching for high-churn environments |
-| Kafka consumer lag | Increase `BATCH_SIZE` and `MAX_CONCURRENT`; add consumer replicas with same group ID |
+## Sequence diagram — streaming pipeline
+
+```
+kafka-pipeline          classifier-service      review-api          Stream Catalog
+      │                        │                    │                     │
+      │─── poll() ────────────▶│                    │                     │
+      │◀── message ────────────│                    │                     │
+      │                        │                    │                     │
+      │─── POST /classify ────▶│                    │                     │
+      │                        │── Layer 1 ─────────│                     │
+      │                        │── Layer 2 ─────────│                     │
+      │                        │── Layer 3 ─────────│                     │
+      │◀── classification ─────│                    │                     │
+      │                        │                    │                     │
+      │── produce to topic ───▶│ (classified-msgs)  │                     │
+      │── produce to topic ───▶│ (audit)            │                     │
+      │                        │                    │                     │
+      │─── POST /recommendations ────────────────▶ │                     │
+      │◀── 200 OK ──────────────────────────────── │                     │
+      │                        │                    │                     │
+      │── commit offset ───────│                    │                     │
+      │                        │     (human reviews /recommendations)     │
+      │                        │                    │── approve ─────────▶│
+      │                        │                    │◀── 200 OK ──────────│
+```

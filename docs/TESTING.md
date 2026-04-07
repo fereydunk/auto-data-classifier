@@ -1,145 +1,227 @@
-# Testing Guide
+# Testing
 
-The test suite is designed to run with **zero external dependencies** — no Confluent Cloud, no GLiNER model download, no GPU.
-
-## Test structure
+## Test suite overview
 
 ```
 tests/
-├── conftest.py                      # sys.path setup for classifier-service and kafka-pipeline
-├── test_taxonomy.py                 # DataCategory / SensitivityLevel logic (pure Python)
-├── test_sensitivity_logic.py        # End-to-end entity type → sensitivity level
-├── test_pci_recognizers.py          # IBAN, SWIFT, routing, crypto wallet regex
-├── test_phi_recognizers.py          # NPI, DEA number, health insurance regex
-├── test_credentials_recognizers.py  # AWS keys, JWTs, connection strings
-├── test_wire_format.py              # Confluent wire-format schema ID extraction
-├── test_catalog_tagger.py           # Stream Catalog tagging (mocked HTTP)
-└── test_classifier_api.py           # /classify and /health endpoints (mocked analyzer)
+├── conftest.py                      sys.path setup for classifier-service + kafka-pipeline
+├── test_classifier_api.py           /classify and /health endpoint tests (13 tests)
+├── test_field_name_recognizer.py    Layer 1 — classify_field_name() + is_free_text() (37 tests)
+├── test_taxonomy.py                 DataTag enum + tag_entity() (12 tests)
+├── test_phi_recognizers.py          PHI pattern recognisers
+├── test_pci_recognizers.py          PCI pattern recognisers
+├── test_financial_recognizers.py    FINANCIAL pattern recognisers
+├── test_credentials_recognizers.py  CREDENTIALS pattern recognisers
+├── test_catalog_tagger.py           Stream Catalog tag application logic
+├── test_review_api.py               Review API — create, upsert, approve, reject, bulk (23 tests)
+└── test_wire_format.py              Confluent Avro wire-format deserialization
 ```
 
-**130 tests, 0 external calls.**
+**Total: 222 tests. All pass.**
+
+---
 
 ## Running the tests
 
 ```bash
-# One-time setup
-python3 -m venv .venv
-.venv/bin/pip install pytest pytest-asyncio httpx fastapi presidio-analyzer pydantic
+# All tests
+pytest tests/ -q
 
-# Run all tests
-.venv/bin/pytest tests/ -v
+# Single file
+pytest tests/test_classifier_api.py -v
 
-# Run a specific module
-.venv/bin/pytest tests/test_taxonomy.py -v
+# Specific test
+pytest tests/test_field_name_recognizer.py::TestClassifyFieldName::test_camel_case_handling -v
 
-# Run with short output
-.venv/bin/pytest tests/ -q
+# With coverage
+pytest tests/ --cov=classifier-service --cov-report=term-missing
 ```
 
-## Test strategy by module
+---
 
-### `test_taxonomy.py` (27 tests)
-- Every known entity type maps to the expected `DataCategory`
-- Unknown entity types default to `INTERNAL`
-- Sensitivity level precedence (CRITICAL beats HIGH beats MEDIUM …)
-- All `DataCategory` values have a sensitivity mapping (coverage guard)
-- All `ENTITY_CATEGORY` values are valid `DataCategory` members (type guard)
+## Unit tests — key design decisions
 
-### `test_sensitivity_logic.py` (19 tests)
-- Parametrised: entity type strings → expected sensitivity level string
-- Covers all four levels plus CLEAN
-- PHI beats PCI, CREDENTIALS beats PII
+### Mocking the analyzer (test_classifier_api.py)
 
-### `test_pci_recognizers.py` (13 tests)
-- Parametrised valid inputs for IBAN, SWIFT, routing, crypto wallets
-- Negative tests for non-matching inputs
-- `get_pci_recognizers()` returns all five recognizer instances
+The classifier service has two analyzers (`regex_analyzer`, `ai_analyzer`). Both are mocked in tests so spaCy and GLiNER never load:
 
-### `test_phi_recognizers.py` (8 tests)
-- NPI (10-digit), DEA number (2L+7D), health insurance ID formats
-- Negative tests for short/non-matching strings
+```python
+@pytest.fixture()
+def client():
+    mock_analyzer = MagicMock()
+    with patch("main.build_regex_analyzer", return_value=mock_analyzer), \
+         patch("main.build_ai_analyzer", return_value=mock_analyzer):
+        import main as app_module
+        app_module.regex_analyzer = mock_analyzer
+        app_module.ai_analyzer = mock_analyzer
+        with TestClient(app_module.app) as c:
+            c._mock_analyzer = mock_analyzer
+            yield c
+```
 
-### `test_credentials_recognizers.py` (11 tests)
-- AWS access key (`AKIA…`) — valid and negative
-- JWT (three base64url segments)
-- Connection strings: MongoDB, PostgreSQL, Redis, Kafka
-- Negative: URL without embedded credentials
+`client._mock_analyzer.analyze.return_value = [...]` controls what the analyzer returns for each test.
 
-### `test_wire_format.py` (7 tests)
-- Valid Confluent wire format (magic byte + schema ID)
-- Large schema IDs
-- Plain JSON → None
-- Wrong magic byte → None
-- Too short → None
-- Empty bytes → None
-- Schema ID zero (edge case)
+### Module name collision (test_review_api.py)
 
-### `test_catalog_tagger.py` (16 tests)
-All HTTP calls mocked via `unittest.mock.AsyncMock`.
+Both `classifier-service/main.py` and `review-api/main.py` are named `main`. When the full suite runs, Python's module cache serves the wrong one. Fixed by:
+- Not adding `review-api` to `conftest.py` sys.path
+- Using `_load_review_api()` in `test_review_api.py` which removes the path, re-inserts at front, and clears `sys.modules` before importing
 
-- `_field_qualified_name` format
-- `_highest_category` priority order (PHI > CREDENTIALS > PCI > PII > …)
-- `ensure_tag_definitions`: creates missing tags, skips existing, bootstrap flag
-- `apply_classifications`: PHI → "PHI" tag, PII → "PII" tag, CREDENTIALS → "CREDENTIALS" tag
-- PHI wins over PII on the same field
-- Empty entities → no API call
-- In-process cache prevents duplicate tag API calls
-- HTTP 409 treated as success (idempotent)
+### SQLite in tests (test_review_api.py)
 
-### `test_classifier_api.py` (9 tests)
-GLiNER is stubbed via `sys.modules`. Real `presidio-analyzer` and `pydantic` are used.
+Tests use pytest's `tmp_path` fixture to create a real per-test SQLite file — **not** `:memory:`. Each `aiosqlite.connect(":memory:")` call creates a fresh empty database, so tables initialised in one call would not persist to the next.
 
-- `/health` returns `{"status":"ok","analyzer_ready":true,"version":"2.0.0"}`
-- SSN detected → HIGH + PII category
-- MEDICAL_RECORD detected → CRITICAL + PHI category
-- PASSWORD detected → CRITICAL + CREDENTIALS category
-- Clean message → CLEAN + empty categories
-- Multiple categories returned in single message
-- Nested fields flattened and each leaf analyzed
-- Response always includes `classifier_version` and `classified_at`
-- Numeric fields coerced to string and analyzed
+```python
+@pytest.fixture
+def db_path(tmp_path):
+    return str(tmp_path / "test_recommendations.db")
+```
 
-## Mocking strategy
+---
 
-| Dependency | Strategy | Reason |
-|---|---|---|
-| GLiNER | `sys.modules['gliner'] = MagicMock()` | 300MB model not in test venv |
-| Confluent Kafka | Not imported in test scope | catalog_tagger.py has no Kafka import |
-| httpx (catalog) | `unittest.mock.AsyncMock` | Deterministic HTTP responses |
-| AnalyzerEngine | `unittest.mock.MagicMock` | Isolates API endpoint logic from NLP |
+## End-to-end test guide
 
-## Running the end-to-end demo
-
-The e2e demo uses real Presidio regex recognizers and a real spaCy model (`en_core_web_sm`):
+### Prerequisites
 
 ```bash
-# One-time: install small spaCy model
-.venv/bin/pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
-
-# Run demo
-.venv/bin/python e2e_test.py
+# Install missing dependencies (one-time)
+brew install ngrok/ngrok/ngrok
+.venv/bin/pip install gliner
+.venv/bin/python -m spacy download en_core_web_lg
 ```
 
-GLiNER is stubbed in the demo — NER-based entities (names, addresses, diagnoses) will not appear.
-All regex-based detections (IBAN, JWT, AWS key, credit card, NPI, DEA, connection strings) are real.
+### Step 1 — Start the classifier service
 
-## Adding tests for a new recognizer
+```bash
+bash e2e/start_classifier.sh
+```
 
-1. Create `tests/test_<name>_recognizers.py`
-2. Import from `recognizers/<name>_recognizers.py`
-3. Add parametrised positive and negative tests for each pattern
-4. Add the recognizer's entity types to `test_taxonomy.py::TestCategorizeEntity`
-5. Run `pytest tests/ -q` — all 130 existing tests must still pass
+This installs any missing deps, starts uvicorn on port 8000, and waits for `/health` to return `ok`. GLiNER downloads its model (~500 MB) on first run — allow 60–90 seconds.
 
-## CI integration
+### Step 2 — Expose with ngrok
 
-The test suite is designed for CI with no secrets or external services required:
+In a new terminal tab:
+```bash
+ngrok http 8000
+# → https://xxxx.ngrok-free.app
+```
 
-```yaml
-# Example GitHub Actions step
-- name: Run tests
-  run: |
-    python -m venv .venv
-    .venv/bin/pip install pytest pytest-asyncio httpx fastapi presidio-analyzer pydantic
-    .venv/bin/pytest tests/ -q
+### Step 3 — Run the smoke test
+
+```bash
+# Classifier only (no Confluent credentials needed)
+.venv/bin/python e2e/verify_e2e.py \
+  --classifier-url https://xxxx.ngrok-free.app
+
+# Full end-to-end including Kafka round-trip
+.venv/bin/python e2e/verify_e2e.py \
+  --classifier-url https://xxxx.ngrok-free.app \
+  --bootstrap      pkc-xxx.us-east-1.aws.confluent.cloud:9092 \
+  --api-key        KAFKA_KEY \
+  --api-secret     KAFKA_SECRET \
+  --topic          scanner-test
+```
+
+Expected output:
+```
+── Classifier service (https://xxxx.ngrok-free.app) ──
+  ✓ Health OK — version 3.1.0
+
+── /classify ──
+  ✓ Layer 1 — field name 'ssn' → GOVERNMENT_ID  (layers_used=[1])
+  ✓ Layer 1 — field name 'email' → PII  (layers_used=[1])
+  ✓ Layer 1 — field name 'password' → CREDENTIALS  (layers_used=[1])
+  ✓ Layer 1 — field name 'credit_card_number' → PCI  (layers_used=[1])
+  ✓ Layer 1 — field name 'patient_id' → PHI  (layers_used=[1])
+  ✓ Layer 2 — regex SSN in value → GOVERNMENT_ID  (layers_used=[1, 2])
+  ✓ Layer 2 — regex credit card in value → PCI  (layers_used=[1, 2])
+  ✓ Layer 2 — regex email in value → PII  (layers_used=[1, 2])
+  ✓ Layer 3 — AI model on free-text → GOVERNMENT_ID  (layers_used=[1, 2, 3])
+  ✓ max_layer=1 skips regex/AI → (no tags, as expected)
+  ✓ nested fields flattened → PII  (layers_used=[1])
+
+── Result: 11 passed, 0 failed
+```
+
+### Step 4 — Produce test data to Confluent Cloud
+
+```bash
+.venv/bin/python e2e/produce_test_data.py \
+  --bootstrap  pkc-xxx.us-east-1.aws.confluent.cloud:9092 \
+  --api-key    KAFKA_KEY \
+  --api-secret KAFKA_SECRET \
+  --topic      scanner-test \
+  --count      200
+```
+
+Produces 200 JSON messages covering all 11 tag types including nested structures, free-text comment fields, and mixed-type messages (e.g. e-commerce orders with PII + PCI).
+
+### Step 5 — Run the Flink SQL scanner
+
+1. Build and register the UDFs:
+```bash
+bash flink-scanner/scripts/build.sh
+
+export CONFLUENT_ENVIRONMENT=env-xxxxx
+export CONFLUENT_COMPUTE_POOL=lfcp-xxxxx
+bash flink-scanner/scripts/register.sh
+```
+
+2. Open Confluent Cloud → Flink SQL workspace
+3. Paste `flink-scanner/sql/scan.sql`
+4. Update the configuration block (classifier URL, SR credentials, topic name)
+5. Run Statement A — wait 2 minutes, stop, review the results table
+6. Edit Statement B with the fields you approve, run it
+7. Verify tags in the Stream Catalog
+
+---
+
+## What each test file covers
+
+### test_classifier_api.py
+- `/health` returns `status: ok`, `analyzer_ready: true`, `version: 3.1.0`
+- Layer 1 detection from field name (`ssn`, `email`, `password`)
+- `max_layer=1` skips data inspection — `analyze()` never called
+- `max_layer=1` with a named field still detects (Layer 1 always runs)
+- Regex results tagged as `layer=2`
+- `layers_used` matches `max_layer` setting
+- Clean fields return empty tags
+- Nested fields are flattened
+- Response includes `classifier_version`, `classified_at`, `layers_used`
+- No `sensitivity_level` or `categories` in response (removed in v3.0)
+
+### test_field_name_recognizer.py
+- All 11 tags via field names (parametrised — 70+ field name cases)
+- Generic names (`id`, `value`, `data`, `ref`) return no match
+- Sorted by confidence descending
+- camelCase handling (`creditCardNumber`, `dateOfBirth`, `socialSecurityNumber`)
+- `source == "field_name"` and `layer == 1` on all results
+- No duplicate entity types per field
+- `is_free_text()`: known names, structured names, value word-count heuristic
+
+### test_review_api.py (23 tests)
+- Create recommendation, retrieve by ID
+- Upsert keeps highest confidence for same (topic, field, tag)
+- List with status/topic/tag/tier filters
+- Approve → calls catalog_client, status → APPROVED
+- Reject → status → REJECTED
+- Bulk-approve above min_confidence threshold
+- Summary counts by topic
+
+---
+
+## CI considerations
+
+The test suite requires no network access and no GPU:
+- spaCy and GLiNER are stubbed in `test_classifier_api.py`
+- spaCy `en_core_web_sm` is used by the recogniser tests (installed in venv)
+- GLiNER is stubbed via `sys.modules.setdefault("gliner", MagicMock())` at the top of API tests
+- All SQLite operations use `tmp_path` (no persistent state between tests)
+
+To run in CI without the large models:
+```bash
+pip install -r classifier-service/requirements.txt --extra-index-url https://...
+# spacy download en_core_web_sm is sufficient for unit tests
+python -m spacy download en_core_web_sm
+pytest tests/ -q
 ```

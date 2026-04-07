@@ -1,144 +1,274 @@
 # Classification Taxonomy
 
-The taxonomy is the single source of truth for how entity types map to data categories and sensitivity levels.
-All classification logic derives from `classifier-service/classification/taxonomy.py` — no sensitivity rules live anywhere else.
+## Design principles
 
-## Layers
+- **11 flat tags** — no nested hierarchy, no sensitivity levels baked in
+- **Sensitivity is your policy** — organisations define HIGH/MEDIUM/LOW differently; the classifier gives you the facts, you apply your policy
+- **Every entity maps to exactly one tag** — no ambiguity about where a result lands
+- **Tags are additive** — a single field can carry multiple tags (e.g. `patient_ssn` → PHI + GOVERNMENT_ID)
+
+---
+
+## The 11 tags
+
+### `PII` — Personally Identifiable Information
+General-purpose personal data not covered by a more specific tag.
+
+| Entity type | Examples |
+|---|---|
+| `EMAIL_ADDRESS` | alice@example.com |
+| `PHONE_NUMBER` | +1-555-123-4567 |
+| `PERSON` | First name, last name, full name |
+| `DATE_TIME` | Date of birth, birthdate |
+| `USERNAME` | Login handle, screen name |
+| `EMPLOYEE_ID` | Staff ID, worker ID |
+| `CUSTOMER_ID` | Client ID, account holder ID |
+| `GENDER` | Gender, sex |
+| `NATIONALITY` | Citizenship, nationality |
+
+Field name signals: `email`, `phone_number`, `first_name`, `last_name`, `date_of_birth`, `dob`, `gender`, `username`
+
+---
+
+### `PHI` — Protected Health Information
+Healthcare data governed by HIPAA and similar regulations.
+
+| Entity type | Examples |
+|---|---|
+| `MEDICAL_RECORD` | MRN, patient ID |
+| `MEDICAL_CONDITION` | Diagnosis, ICD code, disease |
+| `MEDICATION` | Drug name, prescription, dosage |
+| `NATIONAL_PROVIDER_ID` | NPI number (healthcare provider) |
+| `DEA_NUMBER` | Drug Enforcement Administration number |
+| `HEALTH_INSURANCE` | Insurance ID, member ID, policy number |
+
+Field name signals: `mrn`, `patient_id`, `diagnosis`, `medication`, `npi`, `dea_number`, `health_insurance_id`
+
+---
+
+### `PCI` — Payment Card Industry data
+Payment card network data governed by PCI-DSS.
+
+| Entity type | Examples |
+|---|---|
+| `CREDIT_CARD` | Card number (PAN), 4111-1111-1111-1111 |
+| `IBAN_CODE` | GB29NWBK60161331926819 |
+| `SWIFT_CODE` | BARCGB22 |
+| `CRYPTO_WALLET` | Bitcoin/Ethereum wallet addresses |
+
+Field name signals: `credit_card_number`, `iban`, `swift`, `crypto_wallet`, `pan`
+
+---
+
+### `CREDENTIALS` — Authentication secrets
+Any secret that grants access to a system.
+
+| Entity type | Examples |
+|---|---|
+| `PASSWORD` | Plaintext or hashed password |
+| `API_KEY` | API key, API secret |
+| `SECRET_KEY` | Generic secret |
+| `ACCESS_TOKEN` | OAuth token, bearer token, auth token |
+| `JWT_TOKEN` | JSON Web Token |
+| `AWS_ACCESS_KEY` | AKIA... access key |
+| `CONNECTION_STRING` | postgresql://user:pass@host/db |
+| `PRIVATE_KEY` | PEM-encoded private key |
+
+Field name signals: `password`, `api_key`, `access_token`, `jwt`, `connection_string`, `private_key`
+
+---
+
+### `FINANCIAL` — Bank account data
+Financial account identifiers that are not payment card data.
+
+| Entity type | Examples |
+|---|---|
+| `BANK_ACCOUNT` | Account number (8–17 digits) |
+| `US_BANK_ROUTING` | 9-digit ABA routing number |
+
+Field name signals: `account_number`, `bank_account`, `routing_number`
+
+---
+
+### `GOVERNMENT_ID` — Government-issued identifiers
+State-issued identification numbers.
+
+| Entity type | Examples |
+|---|---|
+| `US_SSN` | 123-45-6789 |
+| `NIN` | UK National Insurance number |
+| `PASSPORT` | Passport number |
+| `DRIVER_LICENSE` | Driver's licence number |
+| `US_ITIN` | Individual Taxpayer Identification Number |
+| `AU_TFN` | Australian Tax File Number |
+| `SIN` | Canadian Social Insurance Number |
+
+Field name signals: `ssn`, `passport_number`, `driver_license`, `nin`, `au_tfn`
+
+---
+
+### `BIOMETRIC` — Biometric identifiers
+Unique physical or behavioural characteristics.
+
+| Entity type | Examples |
+|---|---|
+| `BIOMETRIC` | Fingerprint hash, facial geometry, retina scan, voiceprint |
+
+Field name signals: `fingerprint`, `facial_recognition`, `retina_scan`, `biometric`
+
+---
+
+### `GENETIC` — Genetic and genomic data
+DNA and genome data subject to strict regulations in many jurisdictions.
+
+| Entity type | Examples |
+|---|---|
+| `GENETIC` | DNA sequence, genome, genotype, SNP data |
+
+Field name signals: `dna_sequence`, `genome`, `genotype`, `genetic`
+
+---
+
+### `NPI` — Non-Public Information
+Material non-public information (MNPI) — insider financial data.
+
+| Entity type | Examples |
+|---|---|
+| `INSIDER_INFO` | Pre-announcement earnings, insider trading data |
+| `EARNINGS_DATA` | Unreleased earnings forecast, financial guidance |
+| `MERGER_ACQUISITION` | M&A deal information |
+
+Field name signals: `mnpi`, `insider`, `nonpublic`, `earnings`, `merger`, `acquisition`
+
+> Note: `NPI` as a tag means Non-Public Information. The healthcare concept "National Provider Identifier" maps to entity type `NATIONAL_PROVIDER_ID` → tag `PHI`.
+
+---
+
+### `LOCATION` — Geolocation and network identifiers
+Precise location data that can identify an individual's movements.
+
+| Entity type | Examples |
+|---|---|
+| `LOCATION` | Street address, city+postcode |
+| `IP_ADDRESS` | IPv4/IPv6 address |
+
+Field name signals: `address`, `street`, `city`, `latitude`, `longitude`, `ip_address`, `geolocation`
+
+---
+
+### `MINOR` — Data relating to minors
+Data about individuals under 13 (COPPA) or 16 (GDPR Art. 8).
+
+| Entity type | Examples |
+|---|---|
+| `MINOR_DATA` | Child ID, minor data, juvenile record |
+
+Field name signals: `child_id`, `minor_data`, `child`, `juvenile`
+
+---
+
+## Entity type → tag mapping
+
+Full mapping defined in `classifier-service/classification/taxonomy.py`:
+
+```python
+ENTITY_TAG = {
+    # PII
+    "EMAIL_ADDRESS":   DataTag.PII,
+    "PHONE_NUMBER":    DataTag.PII,
+    "PERSON":          DataTag.PII,
+    "DATE_TIME":       DataTag.PII,
+    "USERNAME":        DataTag.PII,
+    "EMPLOYEE_ID":     DataTag.PII,
+    "CUSTOMER_ID":     DataTag.PII,
+    "GENDER":          DataTag.PII,
+    "NATIONALITY":     DataTag.PII,
+
+    # PHI
+    "MEDICAL_RECORD":      DataTag.PHI,
+    "MEDICAL_CONDITION":   DataTag.PHI,
+    "MEDICATION":          DataTag.PHI,
+    "NATIONAL_PROVIDER_ID":DataTag.PHI,
+    "DEA_NUMBER":          DataTag.PHI,
+    "HEALTH_INSURANCE":    DataTag.PHI,
+
+    # PCI
+    "CREDIT_CARD":    DataTag.PCI,
+    "IBAN_CODE":      DataTag.PCI,
+    "SWIFT_CODE":     DataTag.PCI,
+    "CRYPTO_WALLET":  DataTag.PCI,
+
+    # CREDENTIALS
+    "PASSWORD":          DataTag.CREDENTIALS,
+    "API_KEY":           DataTag.CREDENTIALS,
+    "SECRET_KEY":        DataTag.CREDENTIALS,
+    "ACCESS_TOKEN":      DataTag.CREDENTIALS,
+    "JWT_TOKEN":         DataTag.CREDENTIALS,
+    "AWS_ACCESS_KEY":    DataTag.CREDENTIALS,
+    "CONNECTION_STRING": DataTag.CREDENTIALS,
+    "PRIVATE_KEY":       DataTag.CREDENTIALS,
+
+    # FINANCIAL
+    "BANK_ACCOUNT":    DataTag.FINANCIAL,
+    "US_BANK_ROUTING": DataTag.FINANCIAL,
+
+    # GOVERNMENT_ID
+    "US_SSN":         DataTag.GOVERNMENT_ID,
+    "NIN":            DataTag.GOVERNMENT_ID,
+    "PASSPORT":       DataTag.GOVERNMENT_ID,
+    "DRIVER_LICENSE": DataTag.GOVERNMENT_ID,
+    "US_ITIN":        DataTag.GOVERNMENT_ID,
+    "AU_TFN":         DataTag.GOVERNMENT_ID,
+    "SIN":            DataTag.GOVERNMENT_ID,
+
+    # BIOMETRIC
+    "BIOMETRIC": DataTag.BIOMETRIC,
+
+    # GENETIC
+    "GENETIC": DataTag.GENETIC,
+
+    # NPI
+    "INSIDER_INFO":       DataTag.NPI,
+    "EARNINGS_DATA":      DataTag.NPI,
+    "MERGER_ACQUISITION": DataTag.NPI,
+
+    # LOCATION
+    "LOCATION":   DataTag.LOCATION,
+    "IP_ADDRESS": DataTag.LOCATION,
+
+    # MINOR
+    "MINOR_DATA": DataTag.MINOR,
+}
+```
+
+Any entity type not in this map defaults to `DataTag.PII`.
+
+---
+
+## Confidence scoring
+
+Scores run from 0.0 to 1.0 and are set per recogniser:
+
+| Layer | Source | Score range | Notes |
+|---|---|---|---|
+| 1 | Field name | 0.78 – 0.95 | Deterministic — based on keyword match quality |
+| 2 | Regex | 0.40 – 0.99 | Higher for more specific patterns (JWT > bank account) |
+| 3 | AI model | 0.50 – 0.99 | spaCy built-ins + GLiNER contextual scores |
+
+### Confidence tiers (used by review-api)
+
+| Tier | Range | Recommended action |
+|---|---|---|
+| HIGH | ≥ 0.85 | Bulk-approve — high reliability |
+| MEDIUM | 0.60 – 0.84 | Review individually |
+| LOW | < 0.60 | Inspect example snippet before approving |
+
+### Priority when multiple tags detected on the same field
+
+When the streaming pipeline or Flink scanner needs to pick a single tag (e.g. for Stream Catalog), it uses this priority order:
 
 ```
-Detected text
-    │
-    ▼
-Entity type          e.g.  "MEDICAL_RECORD"
-    │  (categorize_entity)
-    ▼
-DataCategory         e.g.  PHI
-    │  (sensitivity_for_categories)
-    ▼
-SensitivityLevel     e.g.  CRITICAL
+PHI > CREDENTIALS > PCI > FINANCIAL > GOVERNMENT_ID > BIOMETRIC > GENETIC > NPI > PII > LOCATION > MINOR
 ```
 
-## DataCategory
-
-| Category | Description | Typical industries |
-|---|---|---|
-| `PHI` | Protected Health Information | Healthcare, insurance, pharma |
-| `CREDENTIALS` | Authentication secrets — passwords, tokens, API keys | Any (especially DevOps/SaaS) |
-| `PII` | Personally Identifiable Information | All industries |
-| `PCI` | Payment card and financial account data | Retail, finance, e-commerce |
-| `CONFIDENTIAL` | Business-confidential data | All industries |
-| `INTERNAL` | Internal operational data, low risk | All industries |
-
-## SensitivityLevel
-
-Derived from the **highest-priority** DataCategory present in a field or message.
-
-| Level | Triggered by | Recommended action |
-|---|---|---|
-| `CRITICAL` | PHI or CREDENTIALS | Block / quarantine / alert immediately |
-| `HIGH` | PII or PCI | Route to restricted topic, enforce RBAC |
-| `MEDIUM` | CONFIDENTIAL only | Tag and audit |
-| `LOW` | INTERNAL only | Tag for catalog visibility |
-| `CLEAN` | Nothing detected | Pass through unchanged |
-
-Priority order: `CRITICAL > HIGH > MEDIUM > LOW > CLEAN`
-
-## Entity type catalogue
-
-### PII — Personally Identifiable Information → HIGH
-
-| Entity type | Description | Detection method |
-|---|---|---|
-| `PERSON` | Full or partial name | spaCy NER + GLiNER |
-| `EMAIL_ADDRESS` | Email address | Presidio regex |
-| `PHONE_NUMBER` | Phone number (international formats) | Presidio regex |
-| `LOCATION` | Physical address or city | spaCy NER + GLiNER |
-| `DATE_TIME` | Date of birth (context-sensitive) | spaCy NER + GLiNER |
-| `US_SSN` | US Social Security Number | Presidio regex |
-| `NIN` | UK National Insurance Number | GLiNER |
-| `SIN` | Canadian Social Insurance Number | GLiNER |
-| `AU_TFN` | Australian Tax File Number | GLiNER |
-| `US_ITIN` | US Individual Taxpayer Identification Number | Presidio regex |
-| `PASSPORT` | Passport number | Presidio regex + GLiNER |
-| `DRIVER_LICENSE` | Driver's licence number | Presidio regex + GLiNER |
-| `IP_ADDRESS` | IPv4 / IPv6 address | Presidio regex |
-| `GENDER` | Gender identity | GLiNER |
-| `NATIONALITY` | Nationality | GLiNER |
-| `RELIGION` | Religious affiliation | GLiNER |
-| `RACE_ETHNICITY` | Race or ethnicity | GLiNER |
-| `USERNAME` | Login username | GLiNER |
-| `EMPLOYEE_ID` | Employee identifier | GLiNER |
-| `CUSTOMER_ID` | Customer / member identifier | GLiNER |
-
-### PCI — Payment Card Industry → HIGH
-
-| Entity type | Description | Detection method |
-|---|---|---|
-| `CREDIT_CARD` | Credit or debit card number (Luhn validated) | Presidio regex |
-| `BANK_ACCOUNT` | Bank account number (8–17 digits) | Custom regex |
-| `IBAN_CODE` | International Bank Account Number | Custom regex |
-| `SWIFT_CODE` | SWIFT / BIC code | Custom regex (country-anchored) |
-| `US_BANK_ROUTING` | US ABA routing number | Custom regex |
-| `CRYPTO_WALLET` | Bitcoin or Ethereum wallet address | Custom regex |
-
-### PHI — Protected Health Information → CRITICAL
-
-| Entity type | Description | Detection method |
-|---|---|---|
-| `MEDICAL_RECORD` | Medical record number (MRN) | GLiNER |
-| `HEALTH_INSURANCE` | Health insurance / member ID | Custom regex + GLiNER |
-| `MEDICAL_CONDITION` | Diagnosis or medical condition | GLiNER |
-| `MEDICATION` | Medication or prescription name | GLiNER |
-| `NPI` | US National Provider Identifier (10-digit) | Custom regex |
-| `DEA_NUMBER` | DEA registration number | Custom regex |
-| `BIOMETRIC` | Biometric data (fingerprint, facial scan) | GLiNER |
-
-### CREDENTIALS — Authentication secrets → CRITICAL
-
-| Entity type | Description | Detection method |
-|---|---|---|
-| `PASSWORD` | Password or passphrase | GLiNER |
-| `API_KEY` | Generic API key (hex/alphanumeric, 32–64 chars) | Custom regex |
-| `AWS_ACCESS_KEY` | AWS access key ID (`AKIA...`) | Custom regex |
-| `JWT_TOKEN` | JSON Web Token | Custom regex |
-| `SECRET_KEY` | Secret / private key material | GLiNER |
-| `ACCESS_TOKEN` | Bearer / access token | GLiNER |
-| `PRIVATE_KEY` | PEM private key | GLiNER |
-| `CONNECTION_STRING` | Database URL with embedded credentials | Custom regex |
-
-### CONFIDENTIAL — Business sensitive → MEDIUM
-
-| Entity type | Description | Detection method |
-|---|---|---|
-| `ORGANIZATION` | Company or organisation name | spaCy NER + GLiNER |
-| `CONTRACT_NUMBER` | Contract or agreement number | GLiNER |
-| `TRADE_SECRET` | Trade secret reference | GLiNER |
-
-### INTERNAL — Operational data → LOW
-
-| Entity type | Description | Detection method |
-|---|---|---|
-| `ORDER_NUMBER` | Order or transaction ID | GLiNER |
-| `LOYALTY_CARD` | Loyalty / rewards card number | GLiNER |
-| `LICENSE_PLATE` | Vehicle licence plate | GLiNER |
-| `VEHICLE_ID` | VIN or vehicle identifier | GLiNER |
-| `PRODUCT_ID` | Product ID or SKU | GLiNER |
-| `SHIPMENT_ID` | Shipment or tracking number | GLiNER |
-
-## Extending the taxonomy
-
-To add a new entity type:
-
-1. Add it to `ENTITY_CATEGORY` in `taxonomy.py`:
-   ```python
-   "MY_NEW_ENTITY": DataCategory.PII,
-   ```
-
-2. Add a GLiNER label in `gliner_recognizer.py`:
-   ```python
-   "my natural language label": "MY_NEW_ENTITY",
-   ```
-
-3. Optionally add a regex recognizer if the format is structural.
-
-4. Add a test in `tests/test_taxonomy.py` and the relevant recognizer test file.
+The review-api surfaces all detected `(field, tag)` pairs separately — users can approve whichever tags are relevant to them.

@@ -1,11 +1,11 @@
 # Auto Data Classifier
 
 Domain-agnostic, real-time data classification for Confluent Cloud.
-Inspects Kafka messages in-flight, identifies sensitive data (PII, PHI, PCI, credentials, and more), and surfaces field-level tags directly in the Confluent Stream Catalog — without sending data outside your infrastructure.
+Inspects Kafka messages in-flight, identifies sensitive data across 11 standard tags, and surfaces field-level labels directly in the Confluent Stream Catalog — without sending data outside your infrastructure.
 
 ## Who is this for?
 
-Any organisation running Confluent Cloud that needs to know what sensitive data is flowing through their Kafka topics — before it lands in downstream systems:
+Any organisation running Confluent Cloud that needs to know what sensitive data flows through their Kafka topics — before it lands in downstream systems:
 
 | Industry | Use case |
 |---|---|
@@ -14,211 +14,250 @@ Any organisation running Confluent Cloud that needs to know what sensitive data 
 | **Financial Services** | PCI in payment streams, wire transfers |
 | **HR / Payroll** | Employee SSNs, bank accounts, salary data |
 | **DevOps / SaaS** | Leaked credentials in log events, config payloads |
-| **Web3 / Crypto** | Wallet addresses in transaction logs |
+| **Web3 / Crypto** | Wallet addresses, crypto wallets in transaction logs |
+
+---
 
 ## How it works
 
+Two complementary modes — pick one or run both:
+
+### Mode 1 — Streaming Pipeline (continuous)
+
+Every message flowing through a Kafka topic is classified in real time.
+
 ```
-Confluent Cloud Kafka
-  └─ Source topic (raw messages, Avro or JSON)
-          │
-          ▼
-  Kafka Pipeline (your compute)
-  ├─ Avro deserialization via Schema Registry
-  ├─ POST to local Classifier Service
-  │     ├─ Presidio regex recognizers  (fast path: IBAN, JWT, AWS keys …)
-  │     └─ GLiNER NER model            (slow path: names, addresses, diagnoses …)
-  ├─ Taxonomy: entity type → DataCategory → SensitivityLevel
-  ├─ Route enriched message to tiered output topic
-  └─ Tag schema fields in Confluent Stream Catalog
-          │
-          ▼
-  Output topics              Stream Catalog
-  ├─ classified-pii          customer.email  → PII
-  ├─ classified-medium       patient.mrn     → PHI
-  ├─ classified-safe         order.id        → INTERNAL
-  └─ classification-audit
+Source topic (raw Kafka messages)
+        │
+        ▼
+kafka-pipeline  ──────────────────────────────────────────────────────────┐
+  ├─ Deserialize (Avro via Schema Registry, or plain JSON)                │
+  ├─ POST /classify → classifier-service                                  │
+  │     ├─ Layer 1: field name / schema metadata  (always on)            │
+  │     ├─ Layer 2: regex / structural patterns   (on by default)        │
+  │     └─ Layer 3: spaCy NER + GLiNER AI model   (on by default)       │
+  ├─ Route enriched message:                                              │
+  │     ├─ classified-messages  (tags detected)                          │
+  │     └─ classified-safe      (no tags)                                │
+  ├─ Write to classification-audit topic                                  │
+  └─ POST recommendations → review-api                                   │
+                                                                          │
+review-api  (field-level human review)  ──────────────────────────────────┘
+  ├─ GET  /recommendations          sorted by confidence desc
+  ├─ POST /recommendations/{id}/approve  → Stream Catalog tag applied
+  ├─ POST /recommendations/{id}/reject
+  └─ POST /recommendations/bulk-approve  (approve all score ≥ 0.85)
+```
+
+### Mode 2 — Interactive Flink SQL Scanner (on-demand)
+
+Run a one-shot Flink SQL query to profile a topic for N minutes, review the field-level recommendations in the results pane, then approve and apply tags — all from the Confluent Cloud Flink workspace.
+
+```
+Flink SQL workspace
+  │
+  ├─ Statement A — classify_fields() UDTF
+  │     Reads topic for N minutes, classifies each message,
+  │     shows (field_path, tag, confidence, layer, source, example)
+  │
+  ├─ User reviews results table
+  │
+  └─ Statement B — apply_tag() scalar UDF
+        Applies approved tags to Confluent Stream Catalog
 ```
 
 All model inference is **100% local** — no data leaves your environment at runtime.
 
-## Classification taxonomy
+---
+
+## Classification taxonomy — 11 flat tags
+
+| Tag | What it covers |
+|---|---|
+| `PII` | Names, email, phone, date of birth, username |
+| `PHI` | Medical records, diagnoses, medications, DEA/NPI numbers |
+| `PCI` | Credit/debit cards, IBAN, SWIFT codes, crypto wallets |
+| `CREDENTIALS` | Passwords, API keys, tokens, connection strings |
+| `FINANCIAL` | Bank account numbers, routing numbers |
+| `GOVERNMENT_ID` | SSN, passport, driver's licence, national tax IDs |
+| `BIOMETRIC` | Fingerprints, facial geometry, retina/iris scans |
+| `GENETIC` | DNA sequences, genome/genotype data |
+| `NPI` | Non-Public Information — insider financials, M&A data |
+| `LOCATION` | GPS coordinates, IP addresses, precise geolocation |
+| `MINOR` | Data relating to a person under 13 or 16 (COPPA/GDPR) |
+
+> Sensitivity levels (HIGH/MEDIUM/LOW) are deliberately **not** baked in — organisations define these differently. The 11 tags are the facts; you apply your own sensitivity policy on top.
+
+---
+
+## Three-layer classification
 
 ```
-DataCategory    SensitivityLevel    Example entities
-────────────    ────────────────    ────────────────────────────────────────
-PHI             CRITICAL            MEDICAL_RECORD, MEDICATION, NPI, DEA
-CREDENTIALS     CRITICAL            AWS_ACCESS_KEY, JWT_TOKEN, CONNECTION_STRING
-PII             HIGH                PERSON, EMAIL_ADDRESS, US_SSN, PASSPORT
-PCI             HIGH                CREDIT_CARD, IBAN_CODE, CRYPTO_WALLET
-CONFIDENTIAL    MEDIUM              ORGANIZATION, CONTRACT_NUMBER
-INTERNAL        LOW                 ORDER_NUMBER, LOYALTY_CARD, SHIPMENT_ID
-(none)          CLEAN               —
+Layer 1 — Field name / schema metadata        (always on, zero data access)
+  Inspects only the field name.
+  "email", "ssn", "creditCardNumber" → instant, deterministic match.
+  Handles camelCase, snake_case, PascalCase, abbreviations.
+
+Layer 2 — Regex / structural patterns         (on by default, opt-out available)
+  Runs Presidio's built-in pattern recognisers + custom recognisers for
+  IBAN, SWIFT, crypto wallets, bank accounts, routing numbers, credentials.
+
+Layer 3 — AI model: spaCy + GLiNER            (on by default, opt-out available)
+  spaCy en_core_web_lg for named entity recognition.
+  GLiNER zero-shot model for entity types not covered by regex.
+  Handles free-text fields (comment, notes, description) that would be
+  missed by field-name and regex layers.
 ```
 
-See [docs/TAXONOMY.md](docs/TAXONOMY.md) for the full entity type catalogue.
+Customers control depth with `MAX_LAYER` (1 | 2 | 3, default 3).
+Each detected entity in the response carries `layer` and `source` so reviewers know exactly how a tag was found.
 
-## Project structure
+---
+
+## Services
+
+| Service | Port | Purpose |
+|---|---|---|
+| `classifier-service` | 8000 | FastAPI — classifies field values, three-layer engine |
+| `review-api` | 8001 | FastAPI — stores recommendations, drives human review |
+| `kafka-pipeline` | — | Confluent Cloud consumer/producer, routes messages |
+| `flink-scanner` | — | Java UDFs for Confluent Cloud Flink SQL |
+
+---
+
+## Repository layout
 
 ```
 auto-data-classifier/
-├── classifier-service/          # FastAPI app — Presidio + GLiNER
+├── classifier-service/          FastAPI classification engine
+│   ├── main.py                  Endpoints: /classify, /health
 │   ├── classification/
-│   │   └── taxonomy.py          # DataCategory / SensitivityLevel definitions
-│   ├── recognizers/
-│   │   ├── gliner_recognizer.py # Zero-shot NER (90+ entity labels)
-│   │   ├── pci_recognizers.py   # IBAN, SWIFT, routing, crypto wallets
-│   │   ├── phi_recognizers.py   # NPI, DEA number, health insurance IDs
-│   │   └── credentials_recognizers.py  # AWS keys, JWTs, connection strings
-│   ├── main.py                  # /classify and /health endpoints
-│   ├── requirements.txt
-│   └── Dockerfile
-├── kafka-pipeline/              # Consumer → classify → route → tag
-│   ├── pipeline.py              # Main async consumer/producer loop
-│   ├── catalog_tagger.py        # Confluent Stream Catalog field tagging
-│   ├── config.py                # All config from environment variables
-│   ├── requirements.txt
-│   └── Dockerfile
-├── flink-sql/
-│   └── routing.sql              # Confluent Cloud Flink SQL routing rules
-├── tests/                       # 130 unit tests, zero external dependencies
-├── e2e_test.py                  # End-to-end demo across 7 industries
-├── docker-compose.yml
-├── pytest.ini
-└── .env.example
+│   │   └── taxonomy.py          DataTag enum, tag_entity()
+│   └── recognizers/
+│       ├── field_name_recognizer.py   Layer 1
+│       ├── phi_recognizers.py         PHI patterns
+│       ├── pci_recognizers.py         PCI patterns
+│       ├── financial_recognizers.py   FINANCIAL patterns
+│       ├── credentials_recognizers.py CREDENTIALS patterns
+│       └── gliner_recognizer.py       Layer 3 GLiNER bridge
+│
+├── review-api/                  Human-in-the-loop review service
+│   ├── main.py                  REST endpoints
+│   ├── store.py                 SQLite persistence (aiosqlite)
+│   ├── models.py                Pydantic models
+│   └── catalog_client.py        Stream Catalog tag application
+│
+├── kafka-pipeline/              Confluent Cloud consumer/producer
+│   ├── pipeline.py              Main async loop
+│   ├── config.py                All environment variable config
+│   └── catalog_tagger.py        Stream Catalog tagger + tag definitions
+│
+├── flink-scanner/               Confluent Cloud Flink SQL UDFs
+│   ├── pom.xml                  Maven build (Java 11, Flink 1.19)
+│   ├── src/.../ClassifyFieldsUDF.java   UDTF — calls /classify per message
+│   ├── src/.../ApplyTagUDF.java         Scalar — applies tag to Stream Catalog
+│   ├── sql/scan.sql             Interactive scan template (2 statements)
+│   └── scripts/
+│       ├── build.sh             mvn package → fat JAR
+│       └── register.sh          Upload JAR, CREATE FUNCTION in Flink
+│
+├── e2e/                         End-to-end test tooling
+│   ├── start_classifier.sh      Start classifier natively (no Docker needed)
+│   ├── produce_test_data.py     Produce 200 realistic messages to Confluent
+│   └── verify_e2e.py            Smoke test: 11 /classify assertions + Kafka round-trip
+│
+├── tests/                       Unit / integration test suite (222 tests)
+├── docs/                        Architecture, taxonomy, testing, tuning guides
+├── flink-sql/                   Confluent Cloud Flink SQL routing queries
+└── docker-compose.yml           All three services (classifier + review-api + pipeline)
 ```
+
+---
 
 ## Quick start
 
-### 1. Configure environment
+### Run the classifier locally (no Docker)
 
 ```bash
-cp .env.example .env
-# Edit .env — fill in Confluent Cloud and Schema Registry credentials
-```
+# One-time setup
+pip install gliner
+python -m spacy download en_core_web_lg
 
-### 2. Run with Docker Compose
+# Start the service
+cd classifier-service
+uvicorn main:app --port 8000
 
-```bash
-docker compose up --build
-```
-
-The classifier service pre-downloads spaCy and GLiNER at image build time.
-After the first build, `TRANSFORMERS_OFFLINE=1` prevents any outbound calls at runtime.
-
-### 3. Verify the classifier is up
-
-```bash
-curl http://localhost:8000/health
-# {"status":"ok","analyzer_ready":true,"version":"2.0.0"}
-```
-
-### 4. Classify a message manually
-
-```bash
+# Smoke test
+curl -s http://localhost:8000/health | python3 -m json.tool
 curl -s -X POST http://localhost:8000/classify \
   -H "Content-Type: application/json" \
-  -d '{
-    "fields": {
-      "customer": {"name": "Alice Johnson", "email": "alice@example.com"},
-      "payment": {"card": "4111111111111111"}
-    }
-  }' | python3 -m json.tool
+  -d '{"fields": {"email": "alice@example.com", "ssn": "123-45-6789"}}' \
+  | python3 -m json.tool
 ```
 
-Example response:
+### Run the full stack with Docker Compose
 
-```json
-{
-  "sensitivity_level": "HIGH",
-  "categories": ["PCI", "PII"],
-  "detected_entities": {
-    "customer.name":  [{"entity_type": "PERSON",       "category": "PII", "score": 0.85}],
-    "customer.email": [{"entity_type": "EMAIL_ADDRESS", "category": "PII", "score": 1.0}],
-    "payment.card":   [{"entity_type": "CREDIT_CARD",  "category": "PCI", "score": 1.0}]
-  },
-  "classified_at": "2026-04-06T10:00:00Z",
-  "classifier_version": "2.0.0"
-}
+```bash
+cp .env.example .env   # fill in Confluent credentials
+docker-compose up
 ```
+
+### Run the Flink SQL scanner
+
+```bash
+# 1. Build the UDF JAR
+bash flink-scanner/scripts/build.sh
+
+# 2. Register UDFs in Confluent Cloud
+export CONFLUENT_ENVIRONMENT=env-xxxxx
+export CONFLUENT_COMPUTE_POOL=lfcp-xxxxx
+bash flink-scanner/scripts/register.sh
+
+# 3. Open Confluent Cloud → Flink SQL workspace
+#    Paste flink-scanner/sql/scan.sql, set your classifier URL and topic, run.
+```
+
+### End-to-end test
+
+```bash
+# Start classifier + expose with ngrok
+bash e2e/start_classifier.sh           # terminal 1
+ngrok http 8000                        # terminal 2
+
+# Verify all layers
+.venv/bin/python e2e/verify_e2e.py --classifier-url https://xxxx.ngrok-free.app
+
+# Produce test data
+.venv/bin/python e2e/produce_test_data.py \
+  --topic scanner-test --count 200
+
+# Run unit + integration tests
+pytest tests/ -q
+```
+
+---
 
 ## Configuration
 
-All configuration is via environment variables. See `.env.example` for a full reference.
+All configuration is via environment variables. See `.env.example` for the full list.
 
-| Variable | Required | Description |
+| Variable | Default | Purpose |
 |---|---|---|
-| `CONFLUENT_BOOTSTRAP_SERVERS` | Yes | Kafka bootstrap (e.g. `pkc-xxx.confluent.cloud:9092`) |
-| `CONFLUENT_API_KEY` | Yes | Kafka cluster API key |
-| `CONFLUENT_API_SECRET` | Yes | Kafka cluster API secret |
-| `CONFLUENT_SR_URL` | Yes | Schema Registry URL (e.g. `https://psrc-xxx.confluent.cloud`) |
-| `CONFLUENT_SR_API_KEY` | Yes | Schema Registry API key |
-| `CONFLUENT_SR_API_SECRET` | Yes | Schema Registry API secret |
-| `CONFLUENT_SR_CLUSTER_ID` | Yes | Schema Registry cluster ID (`lsrc-xxx`) — found in Confluent Console → Schema Registry → Cluster settings |
-| `SOURCE_TOPIC` | No | Topic to consume (default: `raw-messages`) |
-| `SINK_TOPIC_PII` | No | HIGH sensitivity output (default: `classified-pii`) |
-| `SINK_TOPIC_MEDIUM` | No | MEDIUM sensitivity output (default: `classified-medium`) |
-| `SINK_TOPIC_SAFE` | No | LOW/CLEAN output (default: `classified-safe`) |
-| `SINK_TOPIC_AUDIT` | No | Lightweight audit log topic (default: `classification-audit`) |
-| `CONSUMER_GROUP` | No | Kafka consumer group (default: `auto-data-classifier`) |
-| `CLASSIFIER_URL` | No | Classifier service URL (default: `http://localhost:8000`) |
+| `MAX_LAYER` | `3` | Classification depth: 1=field name, 2=+regex, 3=+AI |
+| `CLASSIFIER_URL` | `http://localhost:8000` | Classifier service endpoint (pipeline) |
+| `REVIEW_API_URL` | `http://localhost:8001` | Review API endpoint (pipeline) |
+| `SOURCE_TOPIC` | `raw-messages` | Kafka topic to consume |
+| `SINK_TOPIC_CLASSIFIED` | `classified-messages` | Output for messages with tags |
+| `SINK_TOPIC_SAFE` | `classified-safe` | Output for clean messages |
+| `SINK_TOPIC_AUDIT` | `classification-audit` | Audit log topic |
+| `BATCH_SIZE` | `50` | Messages per commit batch |
+| `MAX_CONCURRENT` | `10` | Concurrent classification requests |
 
-## Running tests
+---
 
-```bash
-# Create venv and install test dependencies
-python3 -m venv .venv
-.venv/bin/pip install pytest pytest-asyncio httpx fastapi presidio-analyzer pydantic
+## Docs
 
-# Run the full test suite (no Confluent Cloud or GLiNER required)
-.venv/bin/pytest tests/ -v
-```
-
-```
-130 passed in 0.46s
-```
-
-See [docs/TESTING.md](docs/TESTING.md) for details on test strategy and adding new tests.
-
-## Running the end-to-end demo
-
-```bash
-# Requires: presidio-analyzer, spacy + en_core_web_sm (see docs/TESTING.md)
-.venv/bin/python e2e_test.py
-```
-
-Runs classification across 7 industry scenarios and prints colour-coded results.
-GLiNER is stubbed in the demo venv (no GPU/model download needed) — regex-based detections are real.
-
-## Confluent Cloud Flink SQL routing
-
-After the pipeline routes classified messages to output topics, you can add Flink SQL jobs in Confluent Cloud to further route, filter, or aggregate:
-
-```sql
--- Route HIGH sensitivity messages (copy routing.sql into Flink SQL workspace)
-INSERT INTO sink_pii
-SELECT payload, classification, CURRENT_TIMESTAMP
-FROM classified_messages
-WHERE classification.sensitivity_level IN ('HIGH', 'CRITICAL');
-```
-
-See [flink-sql/routing.sql](flink-sql/routing.sql) for the full routing setup.
-
-## Adding a new industry vertical
-
-1. Add new entity types to `classifier-service/classification/taxonomy.py` under the appropriate `DataCategory`
-2. Add GLiNER labels to `classifier-service/recognizers/gliner_recognizer.py` (`GLINER_ENTITY_MAP`)
-3. Optionally add a regex recognizer file (e.g. `recognizers/retail_recognizers.py`) for structural patterns
-4. Register the new recognizers in `classifier-service/main.py` → `build_analyzer()`
-5. Add tests in `tests/test_<vertical>_recognizers.py`
-
-No changes needed to sensitivity logic, catalog tagging, or the Kafka pipeline.
-
-## Known limitations
-
-See [docs/TUNING.md](docs/TUNING.md) for known false positives and score-tuning guidance.
-
-The most significant current limitation is that **GLiNER requires a GPU or beefy CPU** for production throughput. At 200–500 msg/s on CPU (GLiNER medium model), it is well suited for moderate-volume topics. Very high-throughput topics (>1000 msg/s) should consider:
-- Running multiple classifier replicas
-- Using the fast path (regex only) for numeric/structured fields
-- Reserving GLiNER for free-text fields only
+- [Architecture](docs/ARCHITECTURE.md) — component design, data flows, sequence diagrams
+- [Taxonomy](docs/TAXONOMY.md) — all 11 tags, entity type mappings, confidence scoring
+- [Testing](docs/TESTING.md) — unit tests, integration tests, end-to-end test guide
+- [Tuning](docs/TUNING.md) — performance, confidence thresholds, layer configuration

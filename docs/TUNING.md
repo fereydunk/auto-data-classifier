@@ -1,154 +1,230 @@
 # Tuning Guide
 
-## Known false positives (observed in e2e demo)
+## Classification depth — MAX_LAYER
 
-### 1. SWIFT code matching common English words
+The single most impactful configuration knob. Controls which layers run on every message.
 
-**Symptom:** Words like `"Engineering"`, `"Electronics"`, `"acmecorp"` are flagged as `SWIFT_CODE` (PCI).
-
-**Root cause:** Presidio's spaCy pipeline normalises text (lowercases tokens) before passing to pattern recognisers. The SWIFT regex `[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}` then matches lowercase 8-character words despite being uppercase-only.
-
-**Fix options:**
-- Add a `validate()` method to `SwiftCodeRecognizer` that checks the matched text is uppercase:
-  ```python
-  def validate_result(self, pattern_text: str) -> bool:
-      return pattern_text == pattern_text.upper() and len(pattern_text) >= 8
-  ```
-- Raise the minimum score threshold (see below).
-
----
-
-### 2. DATE_TIME firing on bare numbers
-
-**Symptom:** Salary `"95000"`, account number `"12345678901234"` flagged as `DATE_TIME` (PII).
-
-**Root cause:** spaCy's NER interprets long numeric strings as dates in some contexts.
-
-**Fix:** Add a global minimum score threshold in `/classify`:
-```python
-results = analyzer.analyze(text=text, language=request.language)
-results = [r for r in results if r.score >= 0.5]  # filter noise
+```
+MAX_LAYER=1   Field name only        Latency: <1ms    No data inspection
+MAX_LAYER=2   + Regex patterns       Latency: 5-20ms  Pattern matching on values
+MAX_LAYER=3   + AI model (default)   Latency: 50-500ms Contextual NER on values
 ```
 
----
+Set in `docker-compose.yml` or as an environment variable:
 
-### 3. ORGANIZATION matching currency codes and short tokens
-
-**Symptom:** `"USD"`, `"EUR"` flagged as `ORGANIZATION` (CONFIDENTIAL → MEDIUM).
-
-**Root cause:** spaCy NER misidentifies short all-caps tokens as organisation names.
-
-**Fix:** Add a minimum token length validator for ORGANIZATION, or add a deny list:
-```python
-ORGANIZATION_DENY_LIST = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD"}
+```bash
+MAX_LAYER=2  # skip AI model — good for high-throughput topics or sensitive environments
+MAX_LAYER=1  # field name only — zero data access, useful for schema-only classification
 ```
 
+### When to use each level
+
+| Scenario | Recommended |
+|---|---|
+| High-volume topic (>10k msg/s), schema well-known | `MAX_LAYER=1` |
+| Mixed schema topics, regex patterns reliable | `MAX_LAYER=2` |
+| Free-text fields (comment, notes), unknown schema | `MAX_LAYER=3` |
+| Regulated environment, no value inspection allowed | `MAX_LAYER=1` |
+| Initial topic discovery / onboarding | `MAX_LAYER=3` (via Flink scanner) |
+
 ---
 
-### 4. Generic API key (hex) matching hash values
+## Confidence thresholds
 
-**Symptom:** MD5 / SHA hashes in log events flagged as `API_KEY`.
+### Review API bulk-approve threshold
 
-**Root cause:** `GenericAPIKeyRecognizer` matches 32–64 lowercase hex chars.
+Default: `0.85`. Adjustable per call:
 
-**Fix:** The score is already low (0.35). Set a threshold ≥ 0.4 in the endpoint to suppress it, or use GLiNER context — with GLiNER enabled, hex strings in a non-credential context will not have the label confirmed.
-
----
-
-## Score threshold configuration
-
-Add a configurable threshold to `main.py` to suppress low-confidence noise:
-
-```python
-MIN_SCORE = float(os.getenv("MIN_CLASSIFIER_SCORE", "0.0"))
-
-# In classify():
-results = analyzer.analyze(text=text, language=request.language)
-results = [r for r in results if r.score >= MIN_SCORE]
+```bash
+curl -X POST http://localhost:8001/recommendations/bulk-approve \
+  -H "Content-Type: application/json" \
+  -d '{"min_confidence": 0.90}'
 ```
 
-Recommended starting values:
+### Flink scanner bulk-approve shortcut
 
-| Environment | `MIN_CLASSIFIER_SCORE` | Effect |
+Edit the commented-out bulk-approve query in `sql/scan.sql`:
+```sql
+AND score >= 0.85   -- change to 0.90 for stricter auto-approval
+```
+
+### Recogniser-level score tuning
+
+Each recogniser has a default confidence score. Override in the recogniser file:
+
+```python
+# classifier-service/recognizers/financial_recognizers.py
+class BankAccountRecognizer(PatternRecognizer):
+    PATTERNS = [
+        Pattern("BANK_ACCOUNT", r"\b\d{8,17}\b", 0.4)  # ← lower = less confident
+    ]
+```
+
+Scores to tune by use case:
+
+| Recogniser | Default | Notes |
 |---|---|---|
-| Development / demo | `0.0` | See everything |
-| Staging | `0.4` | Remove very low confidence hits |
-| Production | `0.5` | Balance precision vs recall |
+| `BankAccountRecognizer` | 0.40 | 8-17 digit sequences match many non-financial IDs |
+| `USRoutingNumberRecognizer` | 0.60 | 9-digit sequences — moderate false positive rate |
+| `GLiNERRecognizer` | model output | Varies by entity type and context |
+| Layer 1 (field names) | 0.78–0.95 | Generally reliable; tune rarely |
 
 ---
 
-## Adjusting recognizer scores
+## Throughput tuning
 
-Each `Pattern` in a recognizer has a `score` (0–1). The score represents confidence when that pattern fires in isolation. When multiple recognisers fire on the same text, Presidio returns all results independently — they are not merged.
+### Pipeline batch size
 
-To raise or lower a recognizer's confidence:
-
-```python
-# In pci_recognizers.py
-Pattern(
-    name="BANK_ACCOUNT",
-    regex=r"\b[0-9]{8,17}\b",
-    score=0.4,          # ← adjust this
-)
+```bash
+BATCH_SIZE=50       # messages per commit (default)
+BATCH_SIZE=100      # higher throughput, larger latency window
 ```
 
-Guidelines:
-- `0.9–1.0`: Near-certain structural match (IBAN with checksum, credit card with Luhn, JWT with three segments)
-- `0.7–0.9`: Strong structural match (SWIFT with country code, AWS `AKIA` prefix, DEA format)
-- `0.5–0.7`: Probable match, needs context (NPI 10-digit, routing numbers)
-- `0.3–0.5`: Ambiguous match, only useful with GLiNER context (generic account numbers, hex strings)
+Larger batches amortise Kafka commit overhead. Set to 100–200 for high-volume topics.
+
+### Concurrent classifications
+
+```bash
+MAX_CONCURRENT=10   # parallel /classify calls (default)
+MAX_CONCURRENT=25   # if classifier service has headroom
+```
+
+### Classifier timeout
+
+```bash
+CLASSIFIER_TIMEOUT_S=5.0   # per-request timeout (default)
+CLASSIFIER_TIMEOUT_S=10.0  # if Layer 3 is slow under load
+```
+
+### Classifier service — expected latency by layer
+
+| Layer | p50 | p95 | p99 |
+|---|---|---|---|
+| 1 only | <1ms | 2ms | 5ms |
+| 1+2 | 5ms | 20ms | 50ms |
+| 1+2+3 (CPU) | 100ms | 300ms | 500ms |
+
+Layer 3 latency depends on value length and hardware. On Apple M-series or modern Intel, expect 100–200ms for typical field values (<200 chars). GPU would be 5–10× faster but is not required.
 
 ---
 
-## Adding a deny list for a recognizer
+## Scaling the classifier service
 
-Presidio's `PatternRecognizer` supports a `deny_list` and `context` list out of the box:
+The classifier service is stateless — scale horizontally behind a load balancer:
 
-```python
-class SwiftCodeRecognizer(PatternRecognizer):
-    def __init__(self):
-        super().__init__(
-            supported_entity="SWIFT_CODE",
-            patterns=self.PATTERNS,
-            context=["swift", "bic", "wire", "transfer"],  # boosts score when nearby
-        )
+```yaml
+# docker-compose.yml
+classifier:
+  deploy:
+    replicas: 3
 ```
 
-The `context` list raises the score when those words appear near the match. This is useful for low-confidence recognisers (routing numbers, account numbers) where field names provide strong signal.
+Or on Kubernetes:
+```yaml
+spec:
+  replicas: 3
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "1000m"
+    limits:
+      memory: "4Gi"
+```
+
+GLiNER loads the model into memory once per process (~500 MB). Each replica needs ~1.5 GB RAM (500 MB model + 750 MB spaCy en_core_web_lg + overhead).
 
 ---
 
-## GLiNER threshold tuning
+## Flink scanner — window sizing
 
-The GLiNER recogniser has a `threshold` parameter (default `0.4`). Lower values increase recall at the cost of precision:
+The N-minute window in `scan.sql` is a tradeoff between:
 
-```python
-# In main.py → build_analyzer()
-registry.add_recognizer(GLiNERRecognizer(threshold=0.5))  # stricter
-```
+| Shorter window | Longer window |
+|---|---|
+| Less representative sample | More representative sample |
+| Fewer messages, faster results | More messages, catches rare field combinations |
+| Better for fast-moving topics | Better for low-volume topics |
 
-In production with high-value data (healthcare, finance), start at `0.4` and tune based on observed false positives in the audit topic.
+**Rule of thumb:** aim for 500–2000 unique messages in the sample. For a topic doing 1000 msg/min, 1–2 minutes is sufficient. For a topic doing 10 msg/min, use 10–15 minutes.
 
 ---
 
-## Field-name-aware scoring (future enhancement)
+## Reducing false positives
 
-A significant accuracy improvement is to weight entity scores by the field name. A 10-digit number in a field called `npi_provider` is almost certainly an NPI; the same number in a field called `timestamp` is almost certainly noise.
+### Layer 1 — generic field names
 
-This can be implemented as a post-processing step in `classify()`:
+By design, `id`, `value`, `data`, and `ref` do not match any patterns. If you have domain-specific generic names that should not be classified (e.g. `ref_code`, `internal_id`), add them to an exclusion list:
 
 ```python
-FIELD_NAME_HINTS = {
-    "ssn": {"US_SSN": 0.3},
-    "npi": {"NPI": 0.3},
-    "iban": {"IBAN_CODE": 0.2},
-    "email": {"EMAIL_ADDRESS": 0.1},
-}
+# classifier-service/recognizers/field_name_recognizer.py
+_EXCLUDED_FIELD_NAMES = {"ref_code", "internal_id", "legacy_ref"}
 
-for field_name, results in detected.items():
-    for hint_key, boosts in FIELD_NAME_HINTS.items():
-        if hint_key in field_name.lower():
-            for r in results:
-                if r.entity_type in boosts:
-                    r.score = min(1.0, r.score + boosts[r.entity_type])
+def classify_field_name(field_name: str) -> list[FieldNameMatch]:
+    if field_name in _EXCLUDED_FIELD_NAMES:
+        return []
+    ...
 ```
+
+### Layer 2 — bank account false positives
+
+The `BankAccountRecognizer` matches any 8–17 digit sequence, which catches order IDs, timestamps, and other numeric identifiers. Options:
+
+1. Lower the confidence threshold — it's already at 0.4 (below the MEDIUM tier of 0.60), so it will show as LOW confidence in the review UI
+2. Require field name context — only emit if the field name also suggests financial data
+3. Disable entirely — remove from `get_financial_recognizers()`
+
+### Layer 3 — AI model hallucinations
+
+GLiNER can occasionally produce false positives on short, ambiguous values. Mitigations:
+
+1. Set a minimum value length before running Layer 3: skip values shorter than 10 characters for AI analysis
+2. Raise the review threshold for AI-only results — treat `source="ai_model"` results with `score < 0.75` as LOW confidence regardless of the raw score
+3. Use Layer 3 only for known free-text fields (`is_free_text() == True`)
+
+---
+
+## Deployment options for the classifier service
+
+### Mac laptop (development)
+
+```bash
+bash e2e/start_classifier.sh   # starts natively, no Docker
+ngrok http 8000                 # expose for Flink scanner
+```
+
+### Docker Compose (local / single-node)
+
+```bash
+docker-compose up classifier
+```
+
+### Azure Container Instances (persistent, low-cost)
+
+```bash
+az container create \
+  --resource-group myRG \
+  --name classifier \
+  --image your-registry/classifier-service:latest \
+  --cpu 2 --memory 4 \
+  --ports 8000 \
+  --environment-variables \
+    TRANSFORMERS_OFFLINE=0 \
+  --dns-name-label my-classifier
+```
+
+The public endpoint is `https://my-classifier.{region}.azurecontainer.io:8000`. Use this as `CLASSIFIER_URL` in `scan.sql` and `register.sh`.
+
+GLiNER downloads its model on first start (~500 MB). Mount an Azure File Share to persist the HuggingFace cache across restarts:
+
+```bash
+az container create \
+  ... \
+  --azure-file-volume-account-name STORAGE_ACCOUNT \
+  --azure-file-volume-account-key  STORAGE_KEY \
+  --azure-file-volume-share-name   hf-cache \
+  --azure-file-volume-mount-path   /root/.cache/huggingface
+```
+
+### Cloud Run / Fly.io (serverless)
+
+Both work well for the classifier service since it's a stateless HTTP service. The main consideration is cold-start time — GLiNER takes 60–90 seconds to load, so keep minimum instances = 1 to avoid cold starts during scanning sessions.
