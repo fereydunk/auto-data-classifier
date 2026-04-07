@@ -18,6 +18,9 @@ htmlcov/
 # HuggingFace model cache
 .cache/
 
+# Java build output
+flink-scanner/target/
+
 # IDE
 .idea/
 .vscode/
