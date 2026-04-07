@@ -20,6 +20,7 @@ htmlcov/
 
 # Java build output
 flink-scanner/target/
+flink-scanner/dependency-reduced-pom.xml
 
 # IDE
 .idea/

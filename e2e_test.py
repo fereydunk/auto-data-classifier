@@ -1,341 +1,457 @@
 #!/usr/bin/env python3
 """
-End-to-end classification demo with sample data from multiple industries.
+Auto Data Classifier — end-to-end demonstration (v3.1.0)
 
-Demonstrates that the classifier is completely domain-agnostic — retail,
-healthcare, finance, HR, and DevOps data all flow through the same pipeline
-and surface the right categories and sensitivity levels.
+Runs the three-layer classification engine directly against realistic
+sample data from five industry verticals, and prints a rich console
+report showing every detected field, its tag, confidence, and which
+layer found it.
 
 Usage:
-    python e2e_test.py
+    python e2e_test.py              # all verticals, all layers (default)
+    python e2e_test.py --layer 2   # field name + regex only (no AI model)
+    python e2e_test.py --layer 1   # field name only
+    python e2e_test.py --vertical healthcare
 
-Note: GLiNER is stubbed here (ML model not installed in the test venv).
-      In the Docker image, GLiNER is pre-downloaded and provides NER-based
-      detection on top of the regex layer shown here.
+No Confluent Cloud connection or Docker required.
+GLiNER is stubbed when not installed so the demo always runs.
+
+The 11 supported tags:
+    PII           Personally Identifiable Information
+    PHI           Protected Health Information
+    PCI           Payment Card data
+    CREDENTIALS   Passwords, API keys, tokens, connection strings
+    FINANCIAL     Bank accounts, routing numbers
+    GOVERNMENT_ID Passports, SSN, driver's licence, national IDs
+    BIOMETRIC     Fingerprints, facial geometry, retina scans
+    GENETIC       DNA sequences, genomic data
+    NPI           Non-Public Information (insider / pre-release financials)
+    LOCATION      GPS coordinates, IP addresses, geolocation
+    MINOR         Data relating to persons under 13 or 16
 """
 
+import argparse
 import sys
-import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# ── Stub GLiNER (not installed outside Docker) ───────────────────────────────
-_gliner_mock = MagicMock()
-_gliner_mock.GLiNER.from_pretrained.return_value.predict_entities.return_value = []
-sys.modules["gliner"] = _gliner_mock
+# ── Stub GLiNER when not installed ──────────────────────────────────────────
+try:
+    import gliner  # noqa: F401
+    GLINER_AVAILABLE = True
+except ImportError:
+    _gliner_mock = MagicMock()
+    _gliner_mock.GLiNER.from_pretrained.return_value.predict_entities.return_value = []
+    sys.modules["gliner"] = _gliner_mock
+    GLINER_AVAILABLE = False
 
-# ── Path setup ────────────────────────────────────────────────────────────────
+# ── Path setup ───────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT / "classifier-service"))
 
-# ── Imports ───────────────────────────────────────────────────────────────────
+# ── Imports ──────────────────────────────────────────────────────────────────
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 
-from classification.taxonomy import categorize_entity, sensitivity_for_categories, DataCategory
+from classification.taxonomy import DataTag, tag_entity
+from recognizers.field_name_recognizer import classify_field_name, is_free_text
 from recognizers.gliner_recognizer import GLiNERRecognizer
 from recognizers.pci_recognizers import get_pci_recognizers
 from recognizers.phi_recognizers import get_phi_recognizers
 from recognizers.credentials_recognizers import get_credentials_recognizers
+from recognizers.financial_recognizers import get_financial_recognizers
 
+# ── ANSI colours ─────────────────────────────────────────────────────────────
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+RED     = "\033[91m"
+YELLOW  = "\033[93m"
+CYAN    = "\033[96m"
+GREEN   = "\033[92m"
+BLUE    = "\033[94m"
+MAGENTA = "\033[95m"
+WHITE   = "\033[97m"
+ORANGE  = "\033[38;5;208m"
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-GREEN  = "\033[92m"
-BLUE   = "\033[94m"
-MAGENTA= "\033[95m"
-GREY   = "\033[90m"
-
-LEVEL_COLOR = {
-    "CRITICAL": RED,
-    "HIGH":     YELLOW,
-    "MEDIUM":   CYAN,
-    "LOW":      GREEN,
-    "CLEAN":    GREY,
+TAG_COLOURS = {
+    "PII":           CYAN,
+    "PHI":           RED,
+    "PCI":           YELLOW,
+    "CREDENTIALS":   MAGENTA,
+    "FINANCIAL":     ORANGE,
+    "GOVERNMENT_ID": BLUE,
+    "BIOMETRIC":     GREEN,
+    "GENETIC":       GREEN,
+    "NPI":           RED,
+    "LOCATION":      CYAN,
+    "MINOR":         YELLOW,
 }
 
-CATEGORY_COLOR = {
-    "PHI":          RED,
-    "CREDENTIALS":  RED,
-    "PII":          YELLOW,
-    "PCI":          YELLOW,
-    "CONFIDENTIAL": CYAN,
-    "INTERNAL":     GREEN,
-}
+LAYER_LABEL  = {1: "field_name", 2: "regex",  3: "ai_model"}
+LAYER_COLOUR = {1: GREEN,        2: YELLOW,    3: CYAN}
 
 
-# ── Sample data ───────────────────────────────────────────────────────────────
-SAMPLES = [
-    {
-        "industry": "Retail",
-        "scenario": "Customer order with payment info",
-        "message": {
-            "order_id": "ORD-2026-00123",
+# ── Sample data — five industry verticals ─────────────────────────────────────
+
+VERTICALS = {
+
+    "retail": {
+        "label": "Retail / E-commerce — customer order",
+        "fields": {
+            "order_id":           "ORD-88421",
             "customer": {
-                "name": "Alice Johnson",
-                "email": "alice.johnson@gmail.com",
-                "phone": "+1-555-234-5678",
-                "loyalty_card": "LYL-98765432",
+                "first_name":     "Alice",
+                "last_name":      "Smith",
+                "email_address":  "alice.smith@example.com",
+                "phone_number":   "+1-415-555-0192",
+                "date_of_birth":  "1989-03-14",
+                "ip_address":     "192.168.1.42",
             },
             "payment": {
-                "card_number": "4111111111111111",
-                "billing_zip": "98101",
+                "credit_card_number": "4111-1111-1111-1111",
+                "iban":               "GB29NWBK60161331926819",
+                "billing_address": {
+                    "street":      "123 Main St",
+                    "city":        "San Francisco",
+                    "postal_code": "94105",
+                },
             },
-            "shipping_address": "123 Main St, Seattle, WA 98101",
+            "notes": (
+                "Customer requested gift wrapping and mentioned her daughter's birthday. "
+                "She paid with her Visa ending 1111."
+            ),
         },
     },
-    {
-        "industry": "Healthcare",
-        "scenario": "Patient admission record",
-        "message": {
-            "mrn": "MRN-2026-00456",
-            "patient": {
-                "name": "Bob Smith",
-                "dob": "1975-03-15",
-                "ssn": "123-45-6789",
-                "phone": "555-987-6543",
-            },
-            "clinical": {
-                "diagnosis": "Type 2 diabetes mellitus",
-                "medication": "Metformin 500mg twice daily",
-                "npi_provider": "1234567890",
-                "dea_number": "AB1234563",
-            },
-            "insurance": {
-                "member_id": "BC1234567890",
-                "plan": "BlueCross Gold PPO",
-            },
+
+    "healthcare": {
+        "label": "Healthcare — patient intake record",
+        "fields": {
+            "patient_id":          "MRN-204817",
+            "mrn":                 "MRN-204817",
+            "ssn":                 "123-45-6789",
+            "first_name":          "Bob",
+            "last_name":           "Jones",
+            "date_of_birth":       "1952-07-22",
+            "diagnosis":           "ICD10:E11 — Type 2 Diabetes Mellitus",
+            "medication":          "Metformin 500mg twice daily",
+            "npi":                 "1234567890",
+            "dea_number":          "BJ1234563",
+            "health_insurance_id": "INS-GHI-887765",
+            "comment": (
+                "Patient presented with elevated A1C and reported difficulty managing "
+                "glucose levels. Dr. Smith prescribed Metformin 500mg. Patient's SSN "
+                "is 123-45-6789 per intake form."
+            ),
         },
     },
-    {
-        "industry": "Financial Services",
-        "scenario": "Wire transfer instruction",
-        "message": {
-            "transaction_id": "TXN-20260406-789012",
+
+    "finance": {
+        "label": "Financial Services — payment transaction",
+        "fields": {
+            "transaction_id":     "TXN-9944221",
+            "account_number":     "12345678901234",
+            "routing_number":     "021000021",
+            "credit_card_number": "5500-0000-0000-0004",
+            "swift_code":         "BARCGB22",
+            "iban":               "DE89370400440532013000",
+            "crypto_wallet":      "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf NA",
             "sender": {
-                "account_number": "12345678901234",
-                "iban": "GB29NWBK60161331926819",
-                "swift_bic": "CHASUS33XXX",
-                "routing": "021000021",
+                "first_name":     "Carlos",
+                "email":          "carlos@acme.com",
             },
-            "beneficiary": {
-                "name": "Acme Corp",
-                "iban": "DE89370400440532013000",
-            },
-            "amount": "50000.00",
-            "currency": "USD",
+            "notes": (
+                "Wire transfer flagged for manual review. Sender Carlos confirmed his "
+                "account number ending 1234 and provided routing 021000021."
+            ),
         },
     },
-    {
-        "industry": "HR / Payroll",
-        "scenario": "Employee onboarding record",
-        "message": {
-            "employee_id": "EMP-2026-0042",
-            "personal": {
-                "name": "Carol Davis",
-                "email": "carol.davis@acmecorp.com",
-                "phone": "415-555-0101",
-                "ssn": "987-65-4321",
-                "dob": "1988-07-22",
-            },
-            "payroll": {
-                "bank_account": "98765432109876",
-                "routing_number": "111000038",
-                "salary": "95000",
-            },
-            "department": "Engineering",
+
+    "devops": {
+        "label": "DevOps / SaaS — application config event",
+        "fields": {
+            "service":            "payment-processor",
+            "environment":        "production",
+            "username":           "deploy-bot",
+            "password":           "Xk9!mQ2#rL7$vP4@",
+            "api_key":            "ak_live_4xT7mKqRzL9pN2bW8sY3vH",
+            "jwt":                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.signature",
+            "connection_string":  "postgresql://admin:s3cr3t@db.internal:5432/prod",
+            "private_key":        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...",
+            "access_token":       "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+            "ip_address":         "10.0.1.55",
         },
     },
-    {
-        "industry": "DevOps / SaaS",
-        "scenario": "Leaked config in log event",
-        "message": {
-            "service": "payment-processor",
-            "level": "ERROR",
-            "event": "DB connection failed",
-            "config": {
-                "aws_access_key": "AKIAIOSFODNN7EXAMPLE",
-                "db_url": "postgresql://admin:secret123@prod-db.internal:5432/payments",
-                "jwt_token": (
-                    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-                    ".eyJzdWIiOiJ1c2VyMTIzIn0"
-                    ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-                ),
-            },
+
+    "hr": {
+        "label": "HR / Payroll — employee record (all 11 tags)",
+        "fields": {
+            "employee_id":    "EMP-55291",
+            "first_name":     "Diana",
+            "last_name":      "Müller",
+            "email_address":  "diana.muller@corp.io",
+            "ssn":            "987-65-4321",
+            "passport_number":"P12345678",
+            "driver_license": "DL7654321",
+            "date_of_birth":  "1985-11-03",
+            "bank_account":   "9876543210",
+            "routing_number": "026009593",
+            "fingerprint":    "FP:a3f4b2c1d5e6f7890abc",
+            "dna_sequence":   "ATCGATCGATCGATCGATCGATCGATCGATCG",
+            "genome":         "GRCh38:7:117548628",
+            "ip_address":     "10.0.0.22",
+            "child_id":       "MINOR-8821",
+            "minor_data":     "child age_verified=false",
+            "mnpi":           "Q3 earnings above analyst consensus — embargoed until 08:00 EST",
+            "notes": (
+                "Diana holds dual citizenship. Genome sequencing uploaded for research study. "
+                "Her child (minor) is linked to this account."
+            ),
         },
     },
-    {
-        "industry": "Retail / E-commerce",
-        "scenario": "Clean product catalog entry",
-        "message": {
-            "product_id": "SKU-8891234",
-            "name": "Wireless Bluetooth Headphones",
-            "category": "Electronics",
-            "price": "79.99",
-            "stock": "342",
-            "warehouse": "SEA-3",
-        },
-    },
-    {
-        "industry": "Web3 / Crypto",
-        "scenario": "Transaction log with wallet addresses",
-        "message": {
-            "tx_hash": "0xabc123",
-            "from_wallet": "0x71C7656EC7ab88b098defB751B7401B5f6d8976F",
-            "to_wallet": "0xde0B295669a9FD93d5F28D9Ec85E40f4cb697BA",
-            "amount_eth": "1.5",
-            "gas_price": "21000",
-        },
-    },
-]
+}
 
 
-# ── Classifier setup ──────────────────────────────────────────────────────────
-def build_analyzer() -> AnalyzerEngine:
+# ── Classifier engine ──────────────────────────────────────────────────────────
+
+def build_regex_analyzer() -> AnalyzerEngine:
+    registry = RecognizerRegistry()
+    registry.load_predefined_recognizers()
+    for r in (get_pci_recognizers() + get_phi_recognizers() +
+              get_credentials_recognizers() + get_financial_recognizers()):
+        registry.add_recognizer(r)
+    return AnalyzerEngine(registry=registry, supported_languages=["en"])
+
+
+def build_ai_analyzer() -> AnalyzerEngine:
     nlp_config = {
         "nlp_engine_name": "spacy",
         "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
     }
     provider = NlpEngineProvider(nlp_configuration=nlp_config)
     nlp_engine = provider.create_engine()
-
     registry = RecognizerRegistry()
     registry.load_predefined_recognizers(nlp_engine=nlp_engine)
-    registry.add_recognizer(GLiNERRecognizer())       # stubbed → no NER hits
-    for r in get_pci_recognizers():
-        registry.add_recognizer(r)
-    for r in get_phi_recognizers():
-        registry.add_recognizer(r)
-    for r in get_credentials_recognizers():
-        registry.add_recognizer(r)
-
+    if GLINER_AVAILABLE:
+        registry.add_recognizer(GLiNERRecognizer())
     return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=["en"])
 
 
-def flatten(obj, prefix=""):
+def _flatten(obj, prefix=""):
     flat = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
-            flat.update(flatten(v, f"{prefix}.{k}" if prefix else k))
+            flat.update(_flatten(v, f"{prefix}.{k}" if prefix else k))
     elif isinstance(obj, list):
         for i, v in enumerate(obj):
-            flat.update(flatten(v, f"{prefix}[{i}]"))
-    elif isinstance(obj, str) and obj.strip():
-        flat[prefix] = obj
-    elif obj is not None:
-        flat[prefix] = str(obj)
+            flat.update(_flatten(v, f"{prefix}[{i}]"))
+    else:
+        flat[prefix] = str(obj) if obj is not None else ""
     return flat
 
 
-def classify(analyzer: AnalyzerEngine, message: dict) -> dict:
-    flat = flatten(message)
+def classify(fields: dict, max_layer: int, regex_analyzer, ai_analyzer):
+    flat = _flatten(fields)
     detected = {}
-    all_categories: set[DataCategory] = set()
+    all_tags: set[str] = set()
 
-    for field, text in flat.items():
-        results = analyzer.analyze(text=text, language="en")
-        if results:
-            entries = []
-            for r in results:
-                cat = categorize_entity(r.entity_type)
-                all_categories.add(cat)
+    for field_path, value in flat.items():
+        leaf = field_path.split(".")[-1].strip("[]0123456789")
+        entries = []
+
+        # Layer 1 — field name (always runs)
+        for m in classify_field_name(leaf):
+            entries.append({
+                "entity_type": m.entity_type,
+                "tag":         m.tag,
+                "score":       m.score,
+                "layer":       1,
+                "source":      "field_name",
+                "snippet":     value[:60],
+            })
+            all_tags.add(m.tag)
+
+        # Layer 2 — regex
+        if max_layer >= 2:
+            for r in regex_analyzer.analyze(text=value, language="en"):
+                t = tag_entity(r.entity_type).value
                 entries.append({
                     "entity_type": r.entity_type,
-                    "category": cat.value,
-                    "score": round(r.score, 3),
-                    "value": text[r.start:r.end],
+                    "tag":         t,
+                    "score":       round(r.score, 3),
+                    "layer":       2,
+                    "source":      "regex",
+                    "snippet":     value[r.start:r.end],
                 })
-            detected[field] = entries
+                all_tags.add(t)
 
-    sensitivity = sensitivity_for_categories(all_categories)
-    return {
-        "sensitivity_level": sensitivity.value,
-        "categories": sorted(c.value for c in all_categories),
-        "detected_entities": detected,
+        # Layer 3 — AI model
+        if max_layer >= 3:
+            for r in ai_analyzer.analyze(text=value, language="en"):
+                t = tag_entity(r.entity_type).value
+                entries.append({
+                    "entity_type": r.entity_type,
+                    "tag":         t,
+                    "score":       round(r.score, 3),
+                    "layer":       3,
+                    "source":      "ai_model",
+                    "snippet":     value[r.start:r.end],
+                })
+                all_tags.add(t)
+
+        if entries:
+            # Deduplicate: best entity per (tag, entity_type)
+            best: dict[tuple, dict] = {}
+            for e in entries:
+                key = (e["tag"], e["entity_type"])
+                if key not in best or e["score"] > best[key]["score"]:
+                    best[key] = e
+            detected[field_path] = sorted(best.values(), key=lambda x: -x["score"])
+
+    return detected, sorted(all_tags)
+
+
+# ── Display ────────────────────────────────────────────────────────────────────
+
+def _confidence_bar(score: float) -> str:
+    filled = int(score * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    colour = GREEN if score >= 0.85 else (YELLOW if score >= 0.60 else RED)
+    return f"{colour}{bar}{RESET} {score:.2f}"
+
+
+def _tag_badge(tag: str) -> str:
+    c = TAG_COLOURS.get(tag, WHITE)
+    return f"{BOLD}{c}[{tag}]{RESET}"
+
+
+def _layer_badge(layer: int) -> str:
+    c = LAYER_COLOUR.get(layer, WHITE)
+    return f"{c}L{layer}:{LAYER_LABEL.get(layer, '?')}{RESET}"
+
+
+def print_vertical(label: str, fields: dict, max_layer: int, regex_analyzer, ai_analyzer):
+    print(f"\n{'═' * 76}")
+    print(f"{BOLD}{WHITE}  {label}{RESET}")
+    print(f"{'─' * 76}")
+
+    detected, all_tags = classify(fields, max_layer, regex_analyzer, ai_analyzer)
+
+    if not detected:
+        print(f"  {DIM}No sensitive fields detected.{RESET}")
+    else:
+        for field_path, entities in sorted(detected.items()):
+            best = entities[0]
+            snippet = best["snippet"][:45].replace("\n", " ")
+            snippet_str = f'{DIM}"{snippet}"{RESET}' if snippet else ""
+            print(
+                f"  {BOLD}{field_path:<38}{RESET} "
+                f"{_tag_badge(best['tag']):<28} "
+                f"{_layer_badge(best['layer']):<28} "
+                f"{_confidence_bar(best['score'])}  {snippet_str}"
+            )
+            # Secondary hits (different tag on same field)
+            for e in entities[1:]:
+                if e["tag"] != best["tag"]:
+                    print(
+                        f"  {'':38} "
+                        f"{_tag_badge(e['tag']):<28} "
+                        f"{_layer_badge(e['layer']):<28} "
+                        f"{_confidence_bar(e['score'])}"
+                    )
+
+    tag_line = "  ".join(_tag_badge(t) for t in all_tags) if all_tags else f"{DIM}(none){RESET}"
+    print(f"\n  {BOLD}Tags:{RESET} {tag_line}")
+
+
+def print_summary(results: dict):
+    print(f"\n{'═' * 76}")
+    print(f"{BOLD}{WHITE}  CLASSIFICATION SUMMARY{RESET}")
+    print(f"{'─' * 76}")
+
+    all_possible = [t.value for t in DataTag]
+    all_seen = set()
+    for _, tags in results.values():
+        all_seen.update(tags)
+
+    print(f"\n  {'Vertical':<22}", end="")
+    for tag in all_possible:
+        c = TAG_COLOURS.get(tag, WHITE)
+        print(f"{c}{tag[:4]}{RESET}  ", end="")
+    print()
+    print(f"  {'─' * 22}" + "─" * (6 * len(all_possible)))
+
+    for v_key, (label, tags) in results.items():
+        short = label.split("—")[0].strip()[:20]
+        print(f"  {short:<22}", end="")
+        for tag in all_possible:
+            c = TAG_COLOURS.get(tag, WHITE)
+            mark = f"{BOLD}{c}✓{RESET}   " if tag in tags else f"{DIM}·   {RESET}"
+            print(mark, end="")
+        print()
+
+    print(f"\n  {BOLD}All 11 supported tags:{RESET}")
+    descriptions = {
+        "PII":           "Names, email, phone, date of birth, username",
+        "PHI":           "Medical records, diagnoses, medications, NPI/DEA numbers",
+        "PCI":           "Credit/debit cards, IBAN, SWIFT codes, crypto wallets",
+        "CREDENTIALS":   "Passwords, API keys, tokens, connection strings, private keys",
+        "FINANCIAL":     "Bank account numbers, routing numbers",
+        "GOVERNMENT_ID": "SSN, passport, driver's licence, national tax IDs",
+        "BIOMETRIC":     "Fingerprints, facial geometry, retina/iris scans, voiceprints",
+        "GENETIC":       "DNA sequences, genome/genotype data",
+        "NPI":           "Non-Public Information — insider financials, M&A data",
+        "LOCATION":      "GPS coordinates, IP addresses, precise geolocation",
+        "MINOR":         "Data relating to a person under 13 or 16 (COPPA / GDPR)",
     }
+    for tag in all_possible:
+        c = TAG_COLOURS.get(tag, WHITE)
+        seen_marker = f"{GREEN}✓ detected{RESET}" if tag in all_seen else f"{DIM}not triggered{RESET}"
+        print(f"    {BOLD}{c}{tag:<16}{RESET}  {descriptions.get(tag, '')}  [{seen_marker}]")
 
-
-# ── Pretty printing ───────────────────────────────────────────────────────────
-def print_result(sample: dict, result: dict):
-    level = result["sensitivity_level"]
-    lc = LEVEL_COLOR.get(level, RESET)
-
-    print(f"\n{'─'*70}")
-    print(f"  {BOLD}Industry:{RESET}  {sample['industry']}")
-    print(f"  {BOLD}Scenario:{RESET}  {sample['scenario']}")
-    print(f"  {BOLD}Sensitivity:{RESET} {lc}{BOLD}{level}{RESET}")
-
-    cats = result["categories"]
-    if cats:
-        colored_cats = "  ".join(
-            f"{CATEGORY_COLOR.get(c, RESET)}{c}{RESET}" for c in cats
-        )
-        print(f"  {BOLD}Categories:{RESET}  {colored_cats}")
-    else:
-        print(f"  {BOLD}Categories:{RESET}  {GREY}none{RESET}")
-
-    detected = result["detected_entities"]
-    if detected:
-        print(f"\n  {BOLD}Detected fields:{RESET}")
-        for field, entities in detected.items():
-            for e in entities:
-                cc = CATEGORY_COLOR.get(e["category"], RESET)
-                score_color = RED if e["score"] >= 0.85 else YELLOW if e["score"] >= 0.5 else GREY
-                print(
-                    f"    {BLUE}{field:<35}{RESET}"
-                    f"  {cc}{e['category']:<12}{RESET}"
-                    f"  {GREY}{e['entity_type']:<22}{RESET}"
-                    f"  {score_color}score={e['score']:.3f}{RESET}"
-                    f"  {GREY}→ {e['value']!r:.30}{RESET}"
-                )
-    else:
-        print(f"\n  {GREY}  No sensitive data detected.{RESET}")
-
-
-def print_summary(results: list[tuple[dict, dict]]):
-    print(f"\n\n{'═'*70}")
-    print(f"  {BOLD}SUMMARY{RESET}")
-    print(f"{'═'*70}")
-    total = len(results)
-    by_level = {}
-    for _, r in results:
-        l = r["sensitivity_level"]
-        by_level[l] = by_level.get(l, 0) + 1
-
-    level_order = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "CLEAN"]
-    for level in level_order:
-        count = by_level.get(level, 0)
-        if count:
-            lc = LEVEL_COLOR.get(level, RESET)
-            bar = "█" * count
-            print(f"  {lc}{level:<10}{RESET}  {bar}  ({count}/{total})")
     print()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
-    print(f"\n{BOLD}{'═'*70}{RESET}")
-    print(f"{BOLD}  Auto Data Classifier — End-to-End Demo{RESET}")
-    print(f"{BOLD}{'═'*70}{RESET}")
-    print(f"  Building analyzer (spaCy + Presidio + regex recognizers)...")
+    parser = argparse.ArgumentParser(description="Auto Data Classifier — e2e demo v3.1.0")
+    parser.add_argument("--layer",    type=int, default=3, choices=[1, 2, 3],
+                        help="Max layer: 1=field name, 2=+regex, 3=+AI (default)")
+    parser.add_argument("--vertical", default="all",
+                        choices=["all"] + list(VERTICALS.keys()),
+                        help="Industry vertical to run (default: all)")
+    args = parser.parse_args()
 
-    analyzer = build_analyzer()
-    recognizer_count = len(analyzer.registry.recognizers)
-    print(f"  {GREEN}✓{RESET} Analyzer ready  ({recognizer_count} recognizers loaded)")
-    print(f"  {GREY}  Note: GLiNER is stubbed — NER-based entities (names, addresses){RESET}")
-    print(f"  {GREY}  will appear in production. Regex detections are real.{RESET}")
+    print(f"\n{BOLD}{'═' * 76}{RESET}")
+    print(f"{BOLD}  Auto Data Classifier  ·  v3.1.0  ·  11 data tags  ·  3-layer engine{RESET}")
+    print(f"{BOLD}{'═' * 76}{RESET}")
+    layer_desc = {
+        1: f"{GREEN}Layer 1{RESET} — field name only (zero data access)",
+        2: f"{GREEN}Layer 1{RESET} + {YELLOW}Layer 2{RESET} — field name + regex patterns",
+        3: f"{GREEN}Layer 1{RESET} + {YELLOW}Layer 2{RESET} + {CYAN}Layer 3{RESET} — field name + regex + AI model",
+    }
+    print(f"  Running: {layer_desc[args.layer]}")
+    if not GLINER_AVAILABLE and args.layer == 3:
+        print(f"  {DIM}(GLiNER not installed — Layer 3 uses spaCy NER only){RESET}")
 
-    results = []
-    for sample in SAMPLES:
-        result = classify(analyzer, sample["message"])
-        print_result(sample, result)
-        results.append((sample, result))
+    print("\n  Building analyzers…", end=" ", flush=True)
+    regex_analyzer = build_regex_analyzer()
+    ai_analyzer    = build_ai_analyzer() if args.layer >= 3 else regex_analyzer
+    print("ready.\n")
 
-    print_summary(results)
+    to_run = VERTICALS if args.vertical == "all" else {args.vertical: VERTICALS[args.vertical]}
+    results = {}
+
+    for key, v in to_run.items():
+        print_vertical(v["label"], v["fields"], args.layer, regex_analyzer, ai_analyzer)
+        _, tags = classify(v["fields"], args.layer, regex_analyzer, ai_analyzer)
+        results[key] = (v["label"], set(tags))
+
+    if args.vertical == "all":
+        print_summary(results)
+
+    print(f"{'═' * 76}\n")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ logger = logging.getLogger("catalog_tagger")
 SR_FIELD_TYPE = "sr_field"
 
 # ---------------------------------------------------------------------------
-# Category tag definitions — one per DataCategory
+# Tag definitions — one entry per DataTag (11 total)
 # ---------------------------------------------------------------------------
 def _tag_def(name: str, description: str) -> dict:
     return {
@@ -98,7 +98,7 @@ class CatalogTagger:
         sr_api_key: str,
         sr_api_secret: str,
         sr_cluster_id: str,
-        classifier_version: str = "2.0.0",
+        classifier_version: str = "3.1.0",
     ):
         self._base_url = sr_url.rstrip("/")
         self._auth = (sr_api_key, sr_api_secret)
