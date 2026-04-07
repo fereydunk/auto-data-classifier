@@ -120,6 +120,7 @@ class FieldClassification(BaseModel):
     text_snippet: str
     layer: int        # 1 = field_name, 2 = regex, 3 = ai_model
     source: str       # "field_name" | "regex" | "ai_model"
+    is_free_text: bool = False  # True when field value looks like unstructured prose
 
 
 class ClassifyRequest(BaseModel):
@@ -192,6 +193,7 @@ async def classify(request: ClassifyRequest):
                 text_snippet=value[:80],
                 layer=1,
                 source="field_name",
+                is_free_text=free_text,
             ))
 
         # ── Layer 2: regex ────────────────────────────────────────────────────
@@ -210,6 +212,7 @@ async def classify(request: ClassifyRequest):
                     text_snippet=value[r.start:r.end],
                     layer=2,
                     source="regex",
+                    is_free_text=free_text,
                 ))
 
         # ── Layer 3: AI model ─────────────────────────────────────────────────
@@ -228,6 +231,7 @@ async def classify(request: ClassifyRequest):
                     text_snippet=value[r.start:r.end],
                     layer=3,
                     source="ai_model",
+                    is_free_text=free_text,
                 ))
 
         if field_entries:

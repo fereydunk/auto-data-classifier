@@ -200,7 +200,13 @@ async def run():
     producer = Producer(cfg.kafka_producer_config)
     consumer.subscribe([cfg.SOURCE_TOPIC])
 
-    logger.info("Subscribed to %s — routing to PII/medium/safe topics", cfg.SOURCE_TOPIC)
+    logger.info(
+        "Subscribed to %s — classified→%s | safe→%s | audit→%s",
+        cfg.SOURCE_TOPIC,
+        cfg.SINK_TOPIC_CLASSIFIED,
+        cfg.SINK_TOPIC_SAFE,
+        cfg.SINK_TOPIC_AUDIT,
+    )
 
     shutdown = asyncio.Event()
 
