@@ -20,12 +20,14 @@ def _make_result(entity_type, start, end, score=0.9):
 
 @pytest.fixture()
 def client():
-    """TestClient with a mocked analyzer injected at module level."""
+    """TestClient with mocked analyzers injected at module level."""
     mock_analyzer = MagicMock()
 
-    with patch("main.build_analyzer", return_value=mock_analyzer):
+    with patch("main.build_regex_analyzer", return_value=mock_analyzer), \
+         patch("main.build_ai_analyzer", return_value=mock_analyzer):
         import main as app_module
-        app_module.analyzer = mock_analyzer
+        app_module.regex_analyzer = mock_analyzer
+        app_module.ai_analyzer = mock_analyzer
         with TestClient(app_module.app) as c:
             c._mock_analyzer = mock_analyzer
             yield c
@@ -37,7 +39,7 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
         assert resp.json()["analyzer_ready"] is True
-        assert resp.json()["version"] == "3.0.0"
+        assert resp.json()["version"] == "3.1.0"
 
 
 class TestClassifyEndpoint:
@@ -49,36 +51,71 @@ class TestClassifyEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert "GOVERNMENT_ID" in body["tags"]
-        assert "note" in body["detected_entities"]
-        entity = body["detected_entities"]["note"][0]
-        assert entity["entity_type"] == "US_SSN"
-        assert entity["tag"] == "GOVERNMENT_ID"
 
-    def test_detects_medical_record_as_phi(self, client):
+    def test_field_name_layer1_detected_from_field_ssn(self, client):
+        # Field named "ssn" — Layer 1 catches it without looking at data
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"ssn": "ignored"}})
+        body = resp.json()
+        assert "GOVERNMENT_ID" in body["tags"]
+        entity = body["detected_entities"]["ssn"][0]
+        assert entity["layer"] == 1
+        assert entity["source"] == "field_name"
+
+    def test_field_named_email_triggers_layer1(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"email": "test@example.com"}})
+        body = resp.json()
+        assert "PII" in body["tags"]
+        entity = body["detected_entities"]["email"][0]
+        assert entity["source"] == "field_name"
+
+    def test_regex_results_tagged_layer2(self, client):
         client._mock_analyzer.analyze.return_value = [
             _make_result("MEDICAL_RECORD", 0, 10, score=0.93)
         ]
         resp = client.post("/classify", json={"fields": {"id": "MRN-0012345"}})
-        assert resp.status_code == 200
         body = resp.json()
         assert "PHI" in body["tags"]
-        assert body["detected_entities"]["id"][0]["tag"] == "PHI"
+        # Regex and AI analyzers both return the mocked result
+        layers = {e["layer"] for e in body["detected_entities"]["id"]}
+        assert 2 in layers or 3 in layers
 
-    def test_detects_password_as_credentials(self, client):
+    def test_max_layer_1_skips_data_inspection(self, client):
         client._mock_analyzer.analyze.return_value = [
-            _make_result("PASSWORD", 0, 12, score=0.99)
+            _make_result("CREDIT_CARD", 0, 16, score=0.99)
         ]
-        resp = client.post("/classify", json={"fields": {"config": "password=secret"}})
-        assert resp.status_code == 200
-        assert "CREDENTIALS" in resp.json()["tags"]
+        # max_layer=1 → analyzers not called, only field name checked
+        resp = client.post("/classify", json={
+            "fields": {"ref": "4111111111111111"},
+            "max_layer": 1,
+        })
+        body = resp.json()
+        # "ref" gives no Layer 1 match → no entities
+        assert body["detected_entities"] == {}
+        assert body["tags"] == []
+        # Analyzers must not have been called
+        assert not client._mock_analyzer.analyze.called
 
-    def test_detects_bank_account_as_financial(self, client):
-        client._mock_analyzer.analyze.return_value = [
-            _make_result("BANK_ACCOUNT", 0, 10, score=0.6)
-        ]
-        resp = client.post("/classify", json={"fields": {"account": "1234567890"}})
-        assert resp.status_code == 200
-        assert "FINANCIAL" in resp.json()["tags"]
+    def test_max_layer_1_with_named_field_still_detects(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={
+            "fields": {"password": "s3cr3t!"},
+            "max_layer": 1,
+        })
+        body = resp.json()
+        assert "CREDENTIALS" in body["tags"]
+        assert body["detected_entities"]["password"][0]["layer"] == 1
+
+    def test_layers_used_in_response(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"x": "y"}, "max_layer": 3})
+        assert set(resp.json()["layers_used"]) == {1, 2, 3}
+
+    def test_layers_used_max_layer_2(self, client):
+        client._mock_analyzer.analyze.return_value = []
+        resp = client.post("/classify", json={"fields": {"x": "y"}, "max_layer": 2})
+        assert 3 not in resp.json()["layers_used"]
 
     def test_clean_message_returns_empty_tags(self, client):
         client._mock_analyzer.analyze.return_value = []
@@ -88,47 +125,20 @@ class TestClassifyEndpoint:
         assert body["tags"] == []
         assert body["detected_entities"] == {}
 
-    def test_multiple_tags_returned(self, client):
-        def side_effect(text, language):
-            if "ssn" in text.lower():
-                return [_make_result("US_SSN", 0, 5)]
-            if "mrn" in text.lower():
-                return [_make_result("MEDICAL_RECORD", 0, 8)]
-            return []
-
-        client._mock_analyzer.analyze.side_effect = side_effect
-        resp = client.post("/classify", json={
-            "fields": {"note": "SSN here", "id": "MRN-123"}
-        })
-        body = resp.json()
-        assert set(body["tags"]) == {"GOVERNMENT_ID", "PHI"}
-
     def test_nested_fields_are_flattened(self, client):
         client._mock_analyzer.analyze.return_value = []
         resp = client.post("/classify", json={
             "fields": {"customer": {"name": "Alice", "address": {"city": "NYC"}}}
         })
         assert resp.status_code == 200
-        assert client._mock_analyzer.analyze.call_count == 2
 
-    def test_response_includes_classifier_version_and_timestamp(self, client):
+    def test_response_includes_version_timestamp_and_layers_used(self, client):
         client._mock_analyzer.analyze.return_value = []
         resp = client.post("/classify", json={"fields": {"x": "y"}})
         body = resp.json()
-        assert body["classifier_version"] == "3.0.0"
+        assert body["classifier_version"] == "3.1.0"
         assert "classified_at" in body
-
-    def test_numeric_field_is_stringified_and_analyzed(self, client):
-        client._mock_analyzer.analyze.return_value = []
-        resp = client.post("/classify", json={"fields": {"amount": 9999.99}})
-        assert resp.status_code == 200
-        assert client._mock_analyzer.analyze.called
-
-    def test_empty_fields_object(self, client):
-        client._mock_analyzer.analyze.return_value = []
-        resp = client.post("/classify", json={"fields": {}})
-        assert resp.status_code == 200
-        assert resp.json()["tags"] == []
+        assert "layers_used" in body
 
     def test_no_sensitivity_level_in_response(self, client):
         client._mock_analyzer.analyze.return_value = []

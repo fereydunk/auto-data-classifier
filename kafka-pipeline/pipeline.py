@@ -81,7 +81,7 @@ async def classify_message(
     try:
         response = await client.post(
             f"{cfg.CLASSIFIER_URL}/classify",
-            json={"fields": payload},
+            json={"fields": payload, "max_layer": cfg.MAX_LAYER},
             timeout=cfg.CLASSIFIER_TIMEOUT_S,
         )
         response.raise_for_status()
@@ -159,6 +159,7 @@ async def post_recommendations(
     """
     For each (field, tag) pair in detected_entities, POST one recommendation
     to the review API using the highest-confidence entity for that pair.
+    The source layer that produced that best result is recorded.
     """
     subject = f"{topic}-value"
     for field_path, entities in detected_entities.items():
@@ -181,6 +182,9 @@ async def post_recommendations(
                         "proposed_tag": tag,
                         "entity_type": entity["entity_type"],
                         "confidence": entity["score"],
+                        "layer": entity.get("layer", 3),
+                        "source": entity.get("source", "ai_model"),
+                        "is_free_text": entity.get("is_free_text", False),
                     },
                     timeout=5.0,
                 )

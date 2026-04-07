@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS recommendations (
     entity_type      TEXT NOT NULL,
     confidence       REAL NOT NULL,
     confidence_tier  TEXT NOT NULL,
+    layer            INTEGER NOT NULL DEFAULT 3,
+    source           TEXT NOT NULL DEFAULT 'ai_model',
+    is_free_text     INTEGER NOT NULL DEFAULT 0,
     status           TEXT NOT NULL DEFAULT 'PENDING',
     created_at       TEXT NOT NULL,
     reviewed_at      TEXT,
@@ -46,8 +49,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_rec
 
 _SELECT = """
     SELECT id, topic, subject, schema_id, field_path, proposed_tag,
-           entity_type, confidence, confidence_tier, status,
-           created_at, reviewed_at, reviewed_by
+           entity_type, confidence, confidence_tier, layer, source,
+           is_free_text, status, created_at, reviewed_at, reviewed_by
     FROM recommendations
 """
 
@@ -56,8 +59,9 @@ def _row_to_rec(row) -> Recommendation:
     return Recommendation(
         id=row[0], topic=row[1], subject=row[2], schema_id=row[3],
         field_path=row[4], proposed_tag=row[5], entity_type=row[6],
-        confidence=row[7], confidence_tier=row[8], status=row[9],
-        created_at=row[10], reviewed_at=row[11], reviewed_by=row[12],
+        confidence=row[7], confidence_tier=row[8], layer=row[9],
+        source=row[10], is_free_text=bool(row[11]), status=row[12],
+        created_at=row[13], reviewed_at=row[14], reviewed_by=row[15],
     )
 
 
@@ -96,8 +100,9 @@ class RecommendationStore:
                     # New detection has higher confidence — update in place
                     await db.execute(
                         "UPDATE recommendations SET confidence=?, confidence_tier=?, "
-                        "entity_type=?, schema_id=? WHERE id=?",
-                        (req.confidence, tier, req.entity_type, req.schema_id, existing_id),
+                        "entity_type=?, schema_id=?, layer=?, source=? WHERE id=?",
+                        (req.confidence, tier, req.entity_type, req.schema_id,
+                         req.layer, req.source, existing_id),
                     )
                     await db.commit()
                 # Return the (possibly updated) record
@@ -111,10 +116,12 @@ class RecommendationStore:
             await db.execute(
                 "INSERT INTO recommendations "
                 "(id, topic, subject, schema_id, field_path, proposed_tag, "
-                " entity_type, confidence, confidence_tier, status, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " entity_type, confidence, confidence_tier, layer, source, "
+                " is_free_text, status, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rec_id, req.topic, req.subject, req.schema_id, req.field_path,
                  req.proposed_tag, req.entity_type, req.confidence, tier,
+                 req.layer, req.source, int(req.is_free_text),
                  RecommendationStatus.PENDING.value, now),
             )
             await db.commit()

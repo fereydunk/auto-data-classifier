@@ -35,6 +35,9 @@ class Config:
     # Review API (local)
     REVIEW_API_URL: str = os.getenv("REVIEW_API_URL", "http://localhost:8001")
 
+    # Classification depth: 1 = field name only, 2 = +regex, 3 = +AI (default)
+    MAX_LAYER: int = int(os.getenv("MAX_LAYER", "3"))
+
     # Tuning
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "50"))
     CLASSIFIER_TIMEOUT_S: float = float(os.getenv("CLASSIFIER_TIMEOUT_S", "5.0"))

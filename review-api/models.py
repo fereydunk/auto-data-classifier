@@ -33,6 +33,9 @@ class Recommendation(BaseModel):
     entity_type: str
     confidence: float
     confidence_tier: str
+    layer: int             # 1 = field_name | 2 = regex | 3 = ai_model
+    source: str            # "field_name" | "regex" | "ai_model"
+    is_free_text: bool     # True when field is generic free-text (comment, notes …)
     status: str
     created_at: str
     reviewed_at: Optional[str] = None
@@ -47,6 +50,9 @@ class CreateRecommendationRequest(BaseModel):
     proposed_tag: str
     entity_type: str
     confidence: float
+    layer: int = 3
+    source: str = "ai_model"
+    is_free_text: bool = False
 
 
 class BulkApproveRequest(BaseModel):

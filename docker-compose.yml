@@ -67,6 +67,7 @@ services:
       - CONSUMER_GROUP=${CONSUMER_GROUP:-auto-data-classifier}
       - CLASSIFIER_URL=http://classifier:8000
       - REVIEW_API_URL=http://review-api:8001
+      - MAX_LAYER=${MAX_LAYER:-3}
     restart: unless-stopped
 
 volumes:
