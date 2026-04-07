@@ -226,6 +226,12 @@ async def run():
             msg = consumer.poll(timeout=1.0)
 
             if msg is None:
+                # Flush partial batch when idle — avoids stalling on < BATCH_SIZE messages
+                if pending:
+                    await asyncio.gather(*pending)
+                    pending.clear()
+                    producer.flush()
+                    consumer.commit(asynchronous=False)
                 continue
             if msg.error():
                 if msg.error().code() == KafkaError._PARTITION_EOF:

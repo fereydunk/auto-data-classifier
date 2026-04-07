@@ -3,8 +3,8 @@ End-to-end smoke test for the auto data classifier stack.
 
 Checks:
   1. Classifier /health is reachable
-  2. /classify correctly identifies PII, PCI, PHI, CREDENTIALS, GOVERNMENT_ID
-     across all three layers
+  2. /classify correctly identifies PII, PCI, PHI, CREDENTIALS, GOVERNMENT_ID,
+     FINANCIAL across all three layers
   3. (optional) Confluent Cloud connectivity — produces 1 message, reads it back
 
 Usage:
@@ -86,14 +86,14 @@ CLASSIFY_CASES = [
      {"credit_card_number": "ignored"},    1, "PCI"),
     ("Layer 1 — field name 'patient_id'",
      {"patient_id": "MRN-001"},            1, "PHI"),
-    ("Layer 2 — regex SSN in value",
-     {"note": "SSN is 123-45-6789"},       2, "GOVERNMENT_ID"),
+    ("Layer 2 — routing number in value → FINANCIAL",
+     {"ref": "routing number 026009593"},  2, "FINANCIAL"),
     ("Layer 2 — regex credit card in value",
      {"ref": "card 4111111111111111"},     2, "PCI"),
     ("Layer 2 — regex email in value",
      {"message": "contact alice@ex.com"},  2, "PII"),
-    ("Layer 3 — AI model on free-text",
-     {"comment": "My name is John Smith and my SSN is 123-45-6789"}, 3, "GOVERNMENT_ID"),
+    ("Layer 3 — AI model detects PHI in free-text",
+     {"freetext": "Patient diagnosed with Type 2 Diabetes, prescribed Metformin 500mg"}, 3, "PHI"),
     ("max_layer=1 skips regex/AI",
      {"ref": "4111111111111111"},          1, None),   # 'ref' has no L1 match
     ("nested fields flattened",

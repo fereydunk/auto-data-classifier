@@ -195,6 +195,11 @@ curl -s -X POST http://localhost:8000/classify \
   | python3 -m json.tool
 ```
 
+> **Mac laptop note:** GLiNER (Layer 3) is compute-heavy. Run the pipeline with reduced concurrency and a longer timeout to avoid inference timeouts:
+> ```bash
+> MAX_CONCURRENT=3 CLASSIFIER_TIMEOUT_S=15 python kafka-pipeline/pipeline.py
+> ```
+
 ### Run the full stack with Docker Compose
 
 ```bash
@@ -251,7 +256,8 @@ All configuration is via environment variables. See `.env.example` for the full 
 | `SINK_TOPIC_SAFE` | `classified-safe` | Output for clean messages |
 | `SINK_TOPIC_AUDIT` | `classification-audit` | Audit log topic |
 | `BATCH_SIZE` | `50` | Messages per commit batch |
-| `MAX_CONCURRENT` | `10` | Concurrent classification requests |
+| `MAX_CONCURRENT` | `10` | Concurrent classification requests (use `3` on Mac with Layer 3) |
+| `CLASSIFIER_TIMEOUT_S` | `5.0` | Per-request timeout in seconds (use `15.0` on Mac with Layer 3) |
 
 ---
 

@@ -91,6 +91,23 @@ Both modes use the same three-layer classifier and write tags to the same Conflu
 8. consumer.commit() — manual offset commit after batch
 ```
 
+### Idle-flush — partial batch handling
+
+The pipeline accumulates asyncio tasks up to `BATCH_SIZE` (default 50) before committing. If the topic goes quiet before a full batch is ready, `consumer.poll()` returns `None`. In that case the pipeline immediately gathers all pending tasks, flushes the producer, and commits the consumer offset — preventing messages from stalling indefinitely in a low-throughput window:
+
+```python
+if msg is None:
+    # Flush partial batch when idle — avoids stalling on < BATCH_SIZE messages
+    if pending:
+        await asyncio.gather(*pending)
+        pending.clear()
+        producer.flush()
+        consumer.commit(asynchronous=False)
+    continue
+```
+
+This means end-to-end latency for a small burst of messages is bounded by `consumer.poll(timeout=1.0)` — at most ~1 second — rather than waiting for 49 more messages to arrive.
+
 ### Classification response shape
 
 ```json
@@ -255,6 +272,35 @@ lsrc-abc123:.:.payments-value.v3.customer.email
 ```
 
 Tag definitions are bootstrapped once on first run (idempotent `POST /catalog/v1/types/tagdefs`). Tag application is idempotent — HTTP 409 (already tagged) is treated as success.
+
+---
+
+## Confluent Cloud test environment
+
+The stack was validated end-to-end against the following Confluent Cloud resources:
+
+| Resource | Value |
+|---|---|
+| Environment | DEVTEST |
+| Cluster name | claude-test-cl |
+| Cluster ID | lkc-2pk6ro |
+| Bootstrap servers | pkc-921jm.us-east-2.aws.confluent.cloud:9092 |
+| Schema Registry ID | lsrc-jwp0w |
+| Schema Registry URL | psrc-lq3wm.eu-central-1.aws.confluent.cloud |
+| Topics | raw-messages → classified-messages / classified-safe / classification-audit |
+
+80 messages were produced, 0 errors, 89 tag recommendations generated in the review-api.
+
+### Recommended runtime settings for Mac (local development)
+
+Running with full Layer 3 (GLiNER) on a Mac requires lower concurrency to avoid inference timeouts:
+
+```bash
+MAX_CONCURRENT=3         # GLiNER is compute-heavy; 10 concurrent will timeout on Mac
+CLASSIFIER_TIMEOUT_S=15  # GLiNER inference takes 2–8s per message on Apple silicon/Intel
+```
+
+See [TUNING.md](TUNING.md) for a full explanation of these settings.
 
 ---
 

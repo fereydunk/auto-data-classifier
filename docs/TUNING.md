@@ -82,18 +82,26 @@ BATCH_SIZE=100      # higher throughput, larger latency window
 
 Larger batches amortise Kafka commit overhead. Set to 100–200 for high-volume topics.
 
+### Idle-flush behaviour
+
+The pipeline does not wait for a full `BATCH_SIZE` batch before committing. When `consumer.poll()` returns `None` (no new messages within the poll timeout), any pending asyncio tasks are immediately gathered, the producer is flushed, and the consumer offset is committed. This bounds end-to-end latency for low-volume topics or small bursts to approximately the `poll(timeout=1.0)` interval — at most ~1 second — regardless of `BATCH_SIZE`. No tuning is required; this is automatic.
+
 ### Concurrent classifications
 
 ```bash
 MAX_CONCURRENT=10   # parallel /classify calls (default)
 MAX_CONCURRENT=25   # if classifier service has headroom
+MAX_CONCURRENT=3    # recommended for Mac laptop with Layer 3 (GLiNER is compute-heavy;
+                    # 10 concurrent will cause timeout cascades on Apple silicon/Intel)
 ```
 
 ### Classifier timeout
 
 ```bash
-CLASSIFIER_TIMEOUT_S=5.0   # per-request timeout (default)
-CLASSIFIER_TIMEOUT_S=10.0  # if Layer 3 is slow under load
+CLASSIFIER_TIMEOUT_S=5.0    # per-request timeout (default)
+CLASSIFIER_TIMEOUT_S=10.0   # if Layer 3 is slow under load
+CLASSIFIER_TIMEOUT_S=15.0   # recommended for Mac laptop with Layer 3
+                             # (GLiNER inference runs 2–8s per message locally)
 ```
 
 ### Classifier service — expected latency by layer
