@@ -26,6 +26,28 @@ MAX_LAYER=1  # field name only — zero data access, useful for schema-only clas
 | Free-text fields (comment, notes), unknown schema | `MAX_LAYER=3` |
 | Regulated environment, no value inspection allowed | `MAX_LAYER=1` |
 | Initial topic discovery / onboarding | `MAX_LAYER=3` (via Flink scanner) |
+| **Wizard demo, want fast feedback loop** | **`MAX_LAYER=2`** in `flink-scanner/scan.env` — see below |
+
+### Wizard demo latency — why Card 5 takes 30–90s with MAX_LAYER=3
+
+`classify_fields()` makes one **synchronous, blocking HTTPS call per source
+row** to the classifier service. With MAX_LAYER=3 the classifier runs spaCy
++ GLiNER (~80 zero-shot labels) on every field's value — that's **1–3 s
+per source message** on Apple silicon. Multiplied by 40 messages produced
+by the wizard's wave-1, the floor is ~80 s end-to-end.
+
+For demo iteration speed, set `CLASSIFIER_MAX_LAYER=2` in
+`flink-scanner/scan.env` (the Flink scanner reads this; it's separate from
+`MAX_LAYER` in `.env` which the streaming kafka-pipeline reads). Per-call
+drops to 5–50 ms, so 40 messages → ~5 s total. You lose AI-detected
+entities (free-text, biometric, genetic) but Layer 1 (field-name) and
+Layer 2 (Presidio regex) still catch all the structured PII / PCI /
+GOVERNMENT_ID / CREDENTIALS the demo schema mostly emits.
+
+The proper architectural fixes are (a) batch endpoint
+(`POST /classify_batch` accepting a list), (b) Flink `AsyncTableFunction`
+for concurrent calls — both flagged as Critical findings in the code
+review (see `docs/LEARNINGS.md` → "Recommendation pipeline").
 
 ---
 

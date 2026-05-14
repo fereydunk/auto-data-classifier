@@ -89,6 +89,38 @@ just-deleted statement for tens of seconds afterward. Code that runs
 **Fix:** delete-then-poll-until-gone-then-create. See
 `flink-scanner/scripts/start_scan.sh:submit_statement`.
 
+### `describe` 404 doesn't mean `create` will succeed (namespace race)
+
+Even after the eventually-consistent `describe` returns 404, attempting
+`create` for the same statement name can still return:
+```
+Error: Statement with name "X" already exists.
+```
+CC's control plane has separate stages: `describe` reports 404 *before*
+the namespace is freed for re-create — the namespace stays reserved
+while the underlying job tears down. Polling on `describe` is the wrong
+signal.
+
+**Fix:** poll on the actual signal — try `create`, on "already exists"
+re-delete + sleep with linear backoff (15/30/45/60/75s), retry up to 5
+times. See `flink-scanner/scripts/start_scan.sh:submit_statement`.
+
+### `flink statement list` warns about default endpoint on every call
+
+`No Flink endpoint is specified, defaulting to public endpoint:
+https://flink.<r>.<c>.confluent.cloud` is emitted on every flink command
+even when `--cloud`/`--region` are passed explicitly. Pinning the active
+endpoint silences it for the rest of the CLI session:
+
+```bash
+confluent flink region   use --cloud aws --region us-east-2
+confluent flink endpoint use https://flink.us-east-2.aws.confluent.cloud
+```
+
+Order matters — `region use` *unsets* the endpoint, so `endpoint use`
+must come second. See `setup_wizard/main.py:_pin_flink_endpoint` and the
+top of `flink-scanner/scripts/start_scan.sh`.
+
 ### Interval-join needs source watermark to advance PAST trigger time
 
 The scan-driver SQL:
@@ -154,6 +186,76 @@ subject namespace is held. To free the subject for a fresh registration:
 
 A 404 on the second call after the first succeeded is fine — already-soft-
 deleted subjects sometimes don't need the explicit hard delete.
+
+### Freshly-minted SR API keys take 5–15s to propagate
+
+`confluent api-key create --resource <lsrc-...>` returns immediately, but
+the new key isn't actually authorized on the SR cluster yet. A fast user
+click on Card 5 right after Card 3 saves hits SR with a not-yet-active
+key → HTTP 401 → Card 5 fails on the very first SR call.
+
+**Fix:** `_wait_for_sr_key_active` probes `GET /subjects` with the new
+key after mint (in `cc_env_select`); blocks until 200 (timeout 30s).
+Belt-and-suspenders: `_delete_demo_subject` also retries 401 up to 3×
+with backoff in case propagation drifts past 30s.
+
+---
+
+## Recommendation pipeline
+
+### Bridge must thread the source topic's schema_id through
+
+`results_bridge.py` was hardcoding `schema_id: None` on every POST to
+review-api with a comment "review-api falls back to latest version".
+That fallback works for single-run demos but breaks `validate-staged`'s
+ability to check a recommendation against the *exact* SR schema version
+that produced it — instead it always checks against latest.
+
+**Fix:** `_fetch_source_schema_id(subject)` queries
+`GET /subjects/{topic}-value/versions/latest` once, caches the schema_id
+with 60-s TTL, returns it for every POST. SR errors fall back to None
+(defensive).
+
+### Classify_fields() is the dominant latency in the demo flow
+
+End-to-end Card 5 latency (wave-2 produce → first recommendation in
+review-api) is typically 30–90s, dominated by **40 sequential blocking
+HTTPS calls** from the Flink scan-driver to the classifier service —
+one POST per source row × ~1–3s/call (Layer 3 = GLiNER on Mac).
+
+The math: 40 messages × 2s/call = **80s minimum**, before any network
+latency to ngrok. Three real fixes (architectural, not hacks):
+1. **Batch endpoint**: `POST /classify_batch` accepts a list of records;
+   `classify_fields()` collects N rows then calls once.
+2. **AsyncTableFunction**: replace the blocking `TableFunction` with
+   Flink 1.19's `AsyncTableFunction` so M HTTPS calls run concurrently.
+3. **Lower MAX_LAYER**: `MAX_LAYER=2` in scan.env skips GLiNER, drops
+   per-call to 5–50ms. Fast for demos; loses AI-detected entities.
+
+For the wizard demo today: option 3 is a one-env-var workaround. Options
+1 and 2 are the long-term right fix. See agent code-review notes (Critical
+finding #1 in flink-scanner section).
+
+---
+
+## Wizard topic-rename leaks (fixed via PRIOR_SOURCE_TOPIC tracking)
+
+If the user changes Card 3's topic name between Card 5 runs, the OLD
+topic's resources stay live in CC indefinitely:
+- Old Kafka topic
+- Old SR subject (`{old}-value`)
+- Old long-running Flink statements (`{old}-scan-trigger-scheduled`,
+  `-schema`, `-driver`) — these cost compute pool minutes
+- Old recommendations in review-api
+
+Each rename accumulates dead infrastructure.
+
+**Fix:** persist `PRIOR_SOURCE_TOPIC` in scan.env. `_demo_worker` reads it
+at start; if `prior != current`, `_cleanup_prior_topic(prior)` tears down
+all 4 resource types before provisioning the new topic. Best-effort —
+each step logs but doesn't block the new run. After every successful
+Card 5 start, scan.env's `PRIOR_SOURCE_TOPIC` is updated to the current
+topic so the cleanup is ready for the next rename.
 
 ---
 

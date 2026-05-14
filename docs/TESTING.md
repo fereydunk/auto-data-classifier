@@ -12,7 +12,6 @@ tests/
 ├── test_pci_recognizers.py          PCI pattern recognisers
 ├── test_financial_recognizers.py    FINANCIAL pattern recognisers
 ├── test_credentials_recognizers.py  CREDENTIALS pattern recognisers
-├── test_catalog_tagger.py           kafka-pipeline catalog tagger + new SR field-validation gate
 ├── test_review_api.py               Review API — create, upsert, approve/stage/reject, bulk,
 │                                    submit-staged auto-rejection of stale rows,
 │                                    validate-staged endpoint, DELETE by topic
@@ -25,7 +24,11 @@ tests/
 └── test_wire_format.py              Confluent Avro wire-format deserialization
 ```
 
-**Total: 298 tests. All pass.**
+**Total: 272 tests. All pass.**
+
+(`test_catalog_tagger.py` was deleted in the code-review batch — those 26
+tests covered an unreachable `CatalogTagger` class in kafka-pipeline that
+was removed alongside the tests.)
 
 ---
 
@@ -358,15 +361,6 @@ python flink-scanner/apply_tags.py ... --yes
 - Renders KEY/VALUE block with 16-space indent matching scan.sql formatting
 - Rejects non-AVRO `schemaType` (exit 3); rejects non-record top-level (exit 4)
 - Rejects empty field list; usage error (exit 1) on bad argv
-
-### test_catalog_tagger.py (26 tests)
-- `apply_tags_batch` flat-shape payload to `/catalog/v1/entity/tags`
-- SR field-validation gate drops items whose path isn't in the live schema and returns
-  them in the `dropped` list with a reason
-- Tag-definitions are POSTed once and cached (subsequent submits skip the GET)
-- Cryptic Atlas 400 ("Type ENTITY with name null does not exist") is translated into
-  a useful error message naming the offending subject + field path
-- `_clear_sr_cache` autouse fixture prevents cache leak across tests
 
 ### test_setup_wizard.py (10 tests)
 - `_parse_kafka_region` strips `SASL_SSL://` prefix the newer CLI returns

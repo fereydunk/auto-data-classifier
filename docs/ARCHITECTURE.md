@@ -579,12 +579,36 @@ Then `_register_demo_schema()` builds + registers + re-fetches.
 
 ### Flink scan statements — race-free recreate
 
-`flink-scanner/scripts/start_scan.sh:submit_statement` is delete-then-poll-
-until-gone-then-create instead of skip-if-exists. CC's `confluent flink
-statement describe` is eventually-consistent: a `--stop` followed immediately
-by a check often returned the just-deleted statement as "still running",
-which made the wizard re-use stale SQL with field names from a previous run.
-Polling until 404 then create eliminates the race.
+`flink-scanner/scripts/start_scan.sh:submit_statement` first issues a delete,
+then attempts `create`; on the "already exists" error it re-deletes and
+retries with linear backoff (15/30/45/60/75s, up to 5 attempts). The earlier
+poll-on-describe loop hit a CC-internal race: `describe` returns 404 *before*
+the namespace is freed, so a successful poll could be followed by a "namespace
+not yet free" rejection on `create`. Polling on `create`'s actual failure
+mode is the right signal.
+
+### Topic-rename cleanup
+
+If the user changes Card 3's source topic between Card 5 runs, the wizard
+auto-tears down the **prior topic's** Kafka topic, SR subject, 3
+long-running Flink statements, and review-api recommendations BEFORE
+provisioning the new topic. The previous topic name is persisted as
+`PRIOR_SOURCE_TOPIC` in scan.env; `_demo_worker` reads it on each run,
+compares to `_source_topic()`, and runs `_cleanup_prior_topic` when they
+differ. Best-effort throughout — failures log but don't block the new run.
+
+### Card 5 waits for first recommendation
+
+Wave-2 produce returning means the producer's done — NOT that
+recommendations have landed. The chain is wave-2 → Flink interval-join
+(waits for source watermark) → 40 sequential `classify_fields()` HTTPS
+calls (~1–3s each on Mac due to Layer 3 GLiNER) → results to scan-results
+topic → bridge consume + POST → review-api. End-to-end is typically
+30–90s. `_wait_for_first_recommendations` polls `/recommendations?topic={topic}`
+every 3s after wave-2, emits a progress log every 15s, and only declares
+Card 5 complete when the first recommendation lands (180s budget). On
+timeout: doesn't fail the card, emits a clear "scan ran but no recs landed"
+warning with diagnostic next-steps.
 
 ### Two-wave produce around manual trigger
 

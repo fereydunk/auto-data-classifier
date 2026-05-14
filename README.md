@@ -227,7 +227,7 @@ auto-data-classifier/
 │   │                            is not enabled for your org)
 │   └── verify_e2e.py            Smoke test: 11 /classify assertions + Kafka round-trip
 │
-├── tests/                       Unit / integration test suite (298 tests)
+├── tests/                       Unit / integration test suite (272 tests)
 ├── startup.sh                   Launch the setup wizard at http://localhost:8002
 ├── docs/                        Architecture, taxonomy, testing, tuning guides
 ├── flink-sql/                   Confluent Cloud Flink SQL routing queries
@@ -240,20 +240,35 @@ auto-data-classifier/
 
 ### Easiest path — the setup wizard
 
-For the Flink-UDF demo flow (sign in to CC, pick an env, start the AI
-model + ngrok tunnel, register UDFs, then per-run provision a fresh
-N-field demo topic — N picked in Card 5's UI input, schema built
-dynamically and registered to SR — and watch recommendations land in the
-review UI):
-
 ```bash
 ./startup.sh                       # browser opens at http://localhost:8002
 ```
 
-Walk the cards top-to-bottom: prereqs → CC sign-in → pick env → "Start
-auto-data-classifier" → "Run test demo" → "Open Review UI". The wizard
-mints API keys, writes `.env` + `flink-scanner/scan.env`, and orchestrates
-every subprocess. Each card has its own live log panel.
+Walk the cards top-to-bottom: prereqs → CC sign-in → **pick env (and type
+the source topic name)** → "Start auto-data-classifier" → "Run test demo"
+→ "Open Review UI". The wizard mints API keys, writes `.env` +
+`flink-scanner/scan.env`, and orchestrates every subprocess. Each card
+has its own live log panel.
+
+**The topic name from Card 3's text box is the single source of truth**
+across the entire wizard. Whatever you type — `raw-messages`, `orders`,
+anything — flows through to:
+
+- the Kafka topic that gets created
+- the SR subject (`{topic}-value`)
+- the 3 long-running Flink statement names (`{topic}-scan-driver`, etc.)
+- the bridge's consumer-group + `--topic` arg
+- the review-api filter
+
+If you change the topic name between Card 5 runs, the wizard auto-cleans
+the previous topic's resources (Flink statements, Kafka topic, SR
+subject, review-api recs) before provisioning the new one — no leaks.
+
+Card 5 doesn't mark itself "complete" until at least one recommendation
+actually lands in review-api (timeout 180s). Why: between wave-2 produce
+and the first rec, there's a 30–90s gap (Flink interval-join wait +
+sequential `classify_fields()` HTTPS calls, ~1–3s each on Mac for Layer 3
+GLiNER). Live progress logs every 15s so you see the wait is intentional.
 
 For lower-level usage (run only the classifier, or the streaming pipeline
 without the wizard), use the manual paths below.
