@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tag Recommendations · Review</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    [x-cloak] { display: none; }
+    .row-fade { transition: background-color 0.15s ease; }
+    /* Stale STAGED row — field no longer in live SR schema. Will be auto-rejected on Submit. */
+    .stale-staged { background-color: #fef2f2 !important; }
+    .stale-staged td { color: #991b1b; }
+    .stale-staged .stale-badge {
+      display: inline-block; margin-left: 6px; padding: 1px 6px;
+      font-size: 10px; font-weight: 600; border-radius: 4px;
+      background: #fee2e2; color: #991b1b; cursor: help;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+  <div class="max-w-7xl mx-auto p-6">
+
+    <header class="flex items-center justify-between mb-6">
+      <div>
+        <h1 class="text-2xl font-bold text-slate-900">Tag Recommendations</h1>
+        <p class="text-sm text-slate-500 mt-1">
+          Review auto-detected tags. Approve to <span class="font-medium text-slate-700">stage</span>;
+          when the staged list looks right, click <span class="font-medium text-slate-700">Submit all</span>
+          to push every tag to Confluent Stream Catalog in one batch.
+        </p>
+      </div>
+      <div class="text-right">
+        <div id="count-badge" class="text-3xl font-bold text-indigo-600">—</div>
+        <div id="count-label" class="text-xs uppercase tracking-wider text-slate-500">pending</div>
+      </div>
+    </header>
+
+    <div id="error-banner" class="hidden mb-4 rounded-lg bg-rose-50 border border-rose-200 p-3 text-sm text-rose-800 flex items-start gap-3">
+      <span class="font-bold">⚠</span>
+      <div class="flex-1"><span id="error-text"></span></div>
+      <button onclick="clearError()" class="text-rose-600 hover:text-rose-900 font-bold">×</button>
+    </div>
+
+    <!-- Topic + schema info strip — populated from /recommendations/sources.
+         Plain labels, no dropdown: most demo runs work against a single topic. -->
+    <div id="sources-strip" class="hidden mb-4 rounded-lg bg-white border border-slate-200 px-4 py-3 text-sm">
+      <div class="flex items-center gap-2 text-xs uppercase tracking-wider text-slate-400 mb-2">Topic &amp; schema</div>
+      <div id="sources-list" class="space-y-1 text-sm"></div>
+    </div>
+
+    <div class="bg-white rounded-lg shadow-sm border border-slate-200 p-4 mb-4 flex flex-wrap gap-4 items-center">
+      <div class="flex items-center gap-1" id="status-chips">
+        <button data-status="PENDING"  class="status-chip px-3 py-1 rounded-full text-sm font-medium">Pending</button>
+        <button data-status="STAGED"   class="status-chip px-3 py-1 rounded-full text-sm font-medium">Staged</button>
+        <button data-status="APPROVED" class="status-chip px-3 py-1 rounded-full text-sm font-medium">Approved</button>
+        <button data-status="REJECTED" class="status-chip px-3 py-1 rounded-full text-sm font-medium">Rejected</button>
+      </div>
+
+      <div class="border-l border-slate-200 h-6"></div>
+
+      <label class="text-sm text-slate-600">Tag
+        <select id="tag-filter" class="ml-2 px-2 py-1 border border-slate-300 rounded text-sm bg-white">
+          <option value="">All tags</option>
+        </select>
+      </label>
+
+      <button onclick="loadRecs()" class="ml-auto px-3 py-1 text-sm border border-slate-300 rounded hover:bg-slate-50">
+        ↻ Refresh
+      </button>
+    </div>
+
+    <div class="bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-600 uppercase text-xs tracking-wider">
+          <tr>
+            <th class="px-4 py-3 text-left">Topic</th>
+            <th class="px-4 py-3 text-left">Field path</th>
+            <th class="px-4 py-3 text-left">Proposed tag</th>
+            <th class="px-4 py-3 text-left">Confidence</th>
+            <th class="px-4 py-3 text-left">Source</th>
+            <th class="px-4 py-3 text-right">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rec-tbody" class="divide-y divide-slate-100">
+          <tr><td colspan="6" class="px-4 py-12 text-center text-slate-400">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ─── Staged-for-submission summary ─────────────────────── -->
+    <section id="staged-section" class="bg-white rounded-lg shadow-sm border-2 border-indigo-200 mt-6 hidden">
+      <div class="px-5 py-4 border-b border-indigo-100 flex items-center justify-between">
+        <div>
+          <h2 class="font-semibold text-indigo-900">Staged for submission</h2>
+          <p class="text-xs text-slate-500 mt-1">
+            These tags will be pushed to Stream Catalog in <span class="font-medium">one batch POST</span>
+            when you click Submit. Nothing is in the catalog yet.
+          </p>
+        </div>
+        <button id="submit-btn" onclick="submitStaged()"
+                class="px-4 py-2 text-sm font-medium rounded bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-slate-300">
+          Submit <span id="staged-btn-count">0</span> to Stream Catalog
+        </button>
+      </div>
+      <table class="w-full text-sm">
+        <thead class="bg-indigo-50 text-slate-600 uppercase text-xs tracking-wider">
+          <tr>
+            <th class="px-4 py-2 text-left">Topic</th>
+            <th class="px-4 py-2 text-left">Field</th>
+            <th class="px-4 py-2 text-left">Tag</th>
+            <th class="px-4 py-2 text-left">Confidence</th>
+            <th class="px-4 py-2 text-right"></th>
+          </tr>
+        </thead>
+        <tbody id="staged-tbody" class="divide-y divide-slate-100"></tbody>
+      </table>
+      <div id="submit-status" class="px-5 py-3 text-xs"></div>
+    </section>
+
+    <p class="text-xs text-slate-400 mt-4 text-center">
+      review-api · review and approve recommendations from the auto-data-classifier pipeline
+    </p>
+  </div>
+
+  <script>
+    let currentStatus = "PENDING";
+    let currentTag    = "";
+
+    function tierColor(score) {
+      if (score >= 0.85) return ["bg-emerald-100", "text-emerald-800"];
+      if (score >= 0.60) return ["bg-amber-100",   "text-amber-800"];
+      return                    ["bg-rose-100",     "text-rose-800"];
+    }
+
+    function tierLabel(score) {
+      if (score >= 0.85) return "HIGH";
+      if (score >= 0.60) return "MEDIUM";
+      return "LOW";
+    }
+
+    function setActiveStatusChip() {
+      document.querySelectorAll(".status-chip").forEach(b => {
+        const isActive = b.dataset.status === currentStatus;
+        b.className = "status-chip px-3 py-1 rounded-full text-sm font-medium " + (
+          isActive
+            ? "bg-indigo-600 text-white"
+            : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+        );
+      });
+    }
+
+    function showError(msg) {
+      document.getElementById("error-text").textContent = msg;
+      document.getElementById("error-banner").classList.remove("hidden");
+    }
+
+    function clearError() {
+      document.getElementById("error-banner").classList.add("hidden");
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      })[c]);
+    }
+
+    function repopulateDropdown(selectId, values, currentValue) {
+      const sel = document.getElementById(selectId);
+      const sorted = [...values].filter(Boolean).sort();
+      sel.innerHTML = `<option value="">All tags</option>` +
+        sorted.map(v => `<option value="${escapeHtml(v)}"${v === currentValue ? " selected" : ""}>${escapeHtml(v)}</option>`).join("");
+    }
+
+    function renderRow(rec) {
+      const [bg, text] = tierColor(rec.confidence);
+      const confPct = (rec.confidence * 100).toFixed(0) + "%";
+      const tier    = tierLabel(rec.confidence);
+      const sourceLabel = `L${rec.layer} · ${rec.source}`;
+
+      let actions;
+      if (rec.status === "PENDING") {
+        actions = `
+          <button onclick="approve('${rec.id}')"
+                  class="px-3 py-1 text-xs font-medium rounded bg-emerald-600 text-white hover:bg-emerald-700"
+                  title="Move to staging — actual SR push happens on Submit">
+            Stage
+          </button>
+          <button onclick="reject('${rec.id}')"
+                  class="px-3 py-1 text-xs font-medium rounded bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 ml-2">
+            Reject
+          </button>
+        `;
+      } else if (rec.status === "STAGED") {
+        actions = `
+          <button onclick="unstage('${rec.id}')"
+                  class="px-3 py-1 text-xs font-medium rounded bg-white border border-amber-300 text-amber-800 hover:bg-amber-50">
+            Unstage
+          </button>
+        `;
+      } else {
+        const pillBg = rec.status === "APPROVED" ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-600";
+        const reviewer = rec.reviewed_by ? ` by ${escapeHtml(rec.reviewed_by)}` : "";
+        const when     = rec.reviewed_at ? ` · ${escapeHtml(rec.reviewed_at.slice(0, 16).replace("T", " "))}` : "";
+        actions = `<span class="px-2 py-1 text-xs rounded-full ${pillBg}">${rec.status}${reviewer}${when}</span>`;
+      }
+
+      return `
+        <tr class="row-fade hover:bg-slate-50" data-id="${rec.id}">
+          <td class="px-4 py-3 font-mono text-xs text-slate-700">${escapeHtml(rec.topic)}</td>
+          <td class="px-4 py-3 font-mono text-xs">${escapeHtml(rec.field_path)}</td>
+          <td class="px-4 py-3 font-semibold text-indigo-700">${escapeHtml(rec.proposed_tag)}
+            <span class="block text-xs font-normal text-slate-500">${escapeHtml(rec.entity_type)}${rec.is_free_text ? " · free text" : ""}</span>
+          </td>
+          <td class="px-4 py-3">
+            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${bg} ${text}">
+              ${tier} · ${confPct}
+            </span>
+          </td>
+          <td class="px-4 py-3 text-xs text-slate-500 font-mono">${sourceLabel}</td>
+          <td class="px-4 py-3 text-right whitespace-nowrap">${actions}</td>
+        </tr>
+      `;
+    }
+
+    async function loadRecs() {
+      const params = new URLSearchParams();
+      params.set("status", currentStatus);
+      if (currentTag) params.set("tag", currentTag);
+
+      const tbody = document.getElementById("rec-tbody");
+      try {
+        const resp = await fetch("/recommendations?" + params.toString());
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const recs = await resp.json();
+
+        // Update count + label
+        document.getElementById("count-badge").textContent = recs.length;
+        document.getElementById("count-label").textContent = currentStatus.toLowerCase();
+
+        // Tag dropdown is populated once from the full set (stable thereafter).
+        if (!window._initializedDropdowns) {
+          const all = await fetch("/recommendations").then(r => r.json());
+          repopulateDropdown("tag-filter", new Set(all.map(r => r.proposed_tag)), currentTag);
+          window._initializedDropdowns = true;
+        }
+
+        // Topic + schema strip — refreshed alongside the table.
+        loadSources();
+
+        if (recs.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-12 text-center text-slate-400">
+            No ${currentStatus.toLowerCase()} recommendations${currentTag ? " match your filters" : ""}.
+          </td></tr>`;
+          return;
+        }
+
+        tbody.innerHTML = recs.map(renderRow).join("");
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-12 text-center text-rose-500">
+          Failed to load recommendations: ${escapeHtml(err.message)}
+        </td></tr>`;
+      }
+      // The staged section reflects the FULL staged queue, not the filtered view.
+      loadStaged();
+    }
+
+    async function loadSources() {
+      try {
+        const sources = await fetch("/recommendations/sources").then(r => r.ok ? r.json() : []);
+        const strip = document.getElementById("sources-strip");
+        const list  = document.getElementById("sources-list");
+        if (!sources || sources.length === 0) {
+          strip.classList.add("hidden");
+          return;
+        }
+        strip.classList.remove("hidden");
+        list.innerHTML = sources.map(s => {
+          const schemaPart = s.version != null
+            ? `<span class="font-mono">${escapeHtml(s.subject)}</span> · v${s.version}, id ${s.schema_id}`
+            : `<span class="font-mono">${escapeHtml(s.subject)}</span> <span class="text-slate-400">(not in SR)</span>`;
+          return `
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <span class="text-slate-500">Topic:</span>
+              <span class="font-mono font-medium text-slate-800">${escapeHtml(s.topic)}</span>
+              <span class="text-slate-300">·</span>
+              <span class="text-slate-500">Schema:</span>
+              <span class="text-slate-700">${schemaPart}</span>
+              <span class="text-slate-300">·</span>
+              <span class="text-xs text-slate-500">${s.count} rec(s)</span>
+            </div>
+          `;
+        }).join("");
+      } catch { /* best-effort */ }
+    }
+
+    async function loadStaged() {
+      const section = document.getElementById("staged-section");
+      const tbody   = document.getElementById("staged-tbody");
+      const btnCnt  = document.getElementById("staged-btn-count");
+      const btn     = document.getElementById("submit-btn");
+      try {
+        const staged = await fetch("/recommendations?status=STAGED").then(r => r.json());
+        if (staged.length === 0) {
+          section.classList.add("hidden");
+          return;
+        }
+        section.classList.remove("hidden");
+        btnCnt.textContent = staged.length;
+        btn.disabled = false;
+
+        // Cross-check every staged row against the LIVE SR schema. Stale rows
+        // (field no longer in the schema) get red-tinted with a tooltip; the
+        // server will auto-REJECT them on Submit, so we don't disable submit.
+        let staleByRecId = {};
+        try {
+          const v = await fetch("/recommendations/validate-staged").then(r => r.ok ? r.json() : null);
+          if (v && Array.isArray(v.stale)) {
+            for (const s of v.stale) staleByRecId[s.id] = s.reason;
+          }
+        } catch { /* validate is best-effort UI hint */ }
+
+        tbody.innerHTML = staged.map(r => {
+          const [bg, text] = tierColor(r.confidence);
+          const confPct = (r.confidence * 100).toFixed(0) + "%";
+          const staleReason = staleByRecId[r.id];
+          const rowClass = staleReason ? "stale-staged" : "";
+          const fieldCell = staleReason
+            ? `${escapeHtml(r.field_path)}<span class="stale-badge" title="${escapeHtml(staleReason)} — will be auto-rejected on Submit">stale</span>`
+            : escapeHtml(r.field_path);
+          return `
+            <tr data-id="${r.id}" class="${rowClass}">
+              <td class="px-4 py-2 font-mono text-xs text-slate-600">${escapeHtml(r.topic)}</td>
+              <td class="px-4 py-2 font-mono text-xs">${fieldCell}</td>
+              <td class="px-4 py-2 font-semibold text-indigo-700">${escapeHtml(r.proposed_tag)}
+                <span class="block text-xs font-normal text-slate-500">${escapeHtml(r.entity_type)}</span>
+              </td>
+              <td class="px-4 py-2">
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${bg} ${text}">${confPct}</span>
+              </td>
+              <td class="px-4 py-2 text-right">
+                <button onclick="unstage('${r.id}')"
+                        class="px-2 py-1 text-xs rounded border border-slate-300 text-slate-700 hover:bg-slate-50">
+                  Unstage
+                </button>
+              </td>
+            </tr>
+          `;
+        }).join("");
+
+        const staleCount = Object.keys(staleByRecId).length;
+        if (staleCount > 0) {
+          const stat = document.getElementById("submit-status");
+          stat.innerHTML = `<span class="text-rose-700">⚠ ${staleCount} staged item(s) no longer match the live SR schema and will be auto-rejected on submit.</span>`;
+        }
+      } catch { /* swallow — staged section just stays hidden */ }
+    }
+
+    async function approve(id) {
+      clearError();
+      const row = document.querySelector(`tr[data-id="${id}"]`);
+      if (row) row.style.opacity = "0.5";
+      try {
+        const resp = await fetch(`/recommendations/${id}/approve?reviewed_by=ui`, { method: "POST" });
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => ({}));
+          throw new Error(detail.detail || `HTTP ${resp.status}`);
+        }
+        loadRecs();
+      } catch (err) {
+        if (row) row.style.opacity = "1";
+        showError(`Stage failed: ${err.message}`);
+      }
+    }
+
+    async function reject(id) {
+      clearError();
+      const row = document.querySelector(`tr[data-id="${id}"]`);
+      if (row) row.style.opacity = "0.5";
+      try {
+        const resp = await fetch(`/recommendations/${id}/reject?reviewed_by=ui`, { method: "POST" });
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => ({}));
+          throw new Error(detail.detail || `HTTP ${resp.status}`);
+        }
+        loadRecs();
+      } catch (err) {
+        if (row) row.style.opacity = "1";
+        showError(`Reject failed: ${err.message}`);
+      }
+    }
+
+    async function unstage(id) {
+      clearError();
+      try {
+        const resp = await fetch(`/recommendations/${id}/unstage?reviewed_by=ui`, { method: "POST" });
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => ({}));
+          throw new Error(detail.detail || `HTTP ${resp.status}`);
+        }
+        loadRecs();
+      } catch (err) {
+        showError(`Unstage failed: ${err.message}`);
+      }
+    }
+
+    async function submitStaged() {
+      clearError();
+      const btn   = document.getElementById("submit-btn");
+      const stat  = document.getElementById("submit-status");
+      const count = document.getElementById("staged-btn-count").textContent;
+      if (!confirm(`Push ${count} staged tag(s) to Confluent Stream Catalog in one batch?`)) return;
+      btn.disabled = true;
+      stat.innerHTML = `<span class="text-slate-500">Submitting batch to Stream Catalog…</span>`;
+      try {
+        const resp = await fetch("/recommendations/submit-staged?reviewed_by=ui", { method: "POST" });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+        stat.innerHTML = `<span class="text-emerald-700">✓ Pushed ${data.length} tags to Stream Catalog (single POST).</span>`;
+        loadRecs();
+      } catch (err) {
+        btn.disabled = false;
+        stat.innerHTML = `<span class="text-rose-600">✗ ${escapeHtml(err.message)}</span>`;
+      }
+    }
+
+    // Wire up filters
+    document.querySelectorAll(".status-chip").forEach(b => {
+      b.addEventListener("click", () => {
+        currentStatus = b.dataset.status;
+        setActiveStatusChip();
+        loadRecs();
+      });
+    });
+    document.getElementById("tag-filter").addEventListener("change", e => {
+      currentTag = e.target.value;
+      loadRecs();
+    });
+
+    // Initial render
+    setActiveStatusChip();
+    loadRecs();
+  </script>
+</body>
+</html>

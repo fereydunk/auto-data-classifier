@@ -199,6 +199,17 @@ class RecommendationStore:
                 row = await cur.fetchone()
                 return _row_to_rec(row) if row else None
 
+    async def delete_by_topic(self, topic: str) -> int:
+        """Delete every recommendation for a topic. Returns count deleted.
+
+        Used by the wizard's clean-slate reset so each demo run starts with
+        an empty review UI for the demo topic. Other topics are untouched.
+        """
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute("DELETE FROM recommendations WHERE topic=?", (topic,))
+            await db.commit()
+            return cur.rowcount
+
     async def list_recommendations(
         self,
         status: Optional[str] = None,

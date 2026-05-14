@@ -5,7 +5,8 @@ from pydantic import BaseModel
 
 class RecommendationStatus(str, Enum):
     PENDING  = "PENDING"
-    APPROVED = "APPROVED"
+    STAGED   = "STAGED"     # approved by reviewer, awaiting batch submit to catalog
+    APPROVED = "APPROVED"   # batch-submitted to Stream Catalog
     REJECTED = "REJECTED"
 
 

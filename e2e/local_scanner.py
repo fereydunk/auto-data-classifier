@@ -3,33 +3,35 @@ Local end-to-end scanner — replicates the Flink classify_fields UDF pipeline.
 
 Reads from a Kafka topic, calls the classifier service, and writes results to
 the scan-results topic. Functionally identical to Flink Statement C, but runs
-locally so the classifier URL doesn't need to be reachable from Confluent's
-managed Flink compute pool.
+locally without requiring Confluent Cloud Flink.
 
-WHY THIS EXISTS
-───────────────
-Confluent Cloud Flink compute pools have no outbound internet access. The
-classify_fields() Java UDF (ClassifyFieldsUDF) calls POST /classify on an
-external URL; those HTTP connections silently time out inside the pool.
-Statements A (scheduled trigger) and B (schema-evolution trigger) work fine
-because A uses only native Flink windowing and B calls Schema Registry, which
-is reachable from inside Confluent Cloud.
+WHY THIS EXISTS — FALLBACK PATH
+────────────────────────────────
+The primary classification path is Flink Statement C (scan driver), which uses
+classify_fields() with USING CONNECTIONS to call POST /classify on the external
+classifier URL. USING CONNECTIONS requires the feature to be enabled for your
+Confluent Cloud organisation by the Confluent account team.
 
-This script is the workaround: it runs the same classify → publish logic
-outside the Flink pool, writing to the same {topic}-scan-results topic that
-apply_tags.py consumes. The rest of the pipeline (apply_tags.py → Schema
-Registry) is identical regardless of which path produced the results.
+This script is a fallback for orgs where USING CONNECTIONS is not yet enabled.
+It runs the same classify → publish logic locally, writing to the same
+{topic}-scan-results topic that apply_tags.py consumes. The rest of the pipeline
+(apply_tags.py → Schema Registry) is identical regardless of which path produced
+the results.
 
-FUTURE — USING CONNECTIONS (Early Access)
-─────────────────────────────────────────
-Confluent Cloud Flink is adding a USING CONNECTIONS clause that binds a UDF
-to a Connection object, allowing it to call public HTTP endpoints without
-private networking. Once enabled for your org and classify_fields is
-re-registered with USING CONNECTIONS, Statement C will classify natively inside
-Flink and this script becomes unnecessary.
+apply_tags.py handles both result formats transparently:
+  • Flink Statement C writes Confluent Avro wire format (0x00 + schema ID + bytes)
+  • This script writes plain JSON
 
-See docs/ARCHITECTURE.md — "Flink compute pool — network egress constraint"
-and flink-scanner/scripts/register.sh for the USING CONNECTIONS command.
+WHEN TO USE THIS SCRIPT
+────────────────────────
+Use local_scanner.py only if:
+  1. USING CONNECTIONS is not enabled for your org, OR
+  2. The classifier-service Flink connection is not configured
+
+Otherwise, use the native Flink path:
+  bash flink-scanner/scripts/start_scan.sh --now   (twice, ~60s apart)
+
+See docs/ARCHITECTURE.md — "Flink USING CONNECTIONS — internet egress for UDFs"
 
 USAGE
 ─────
@@ -53,6 +55,7 @@ results are processed and most detections are silently lost.
 """
 
 import argparse
+import base64
 import io as _io
 import json
 import os
@@ -81,76 +84,49 @@ except ImportError:
     sys.exit(1)
 
 
-# ── Avro schema (must match raw-messages-value in SR) ────────────────────────
-_AVRO_SCHEMA = fastavro.parse_schema({
-    "type": "record",
-    "name": "RawMessage",
-    "namespace": "io.confluent.scanner",
-    "fields": [
-        {"name": "customer_id",        "type": ["null", "string"], "default": None},
-        {"name": "first_name",         "type": ["null", "string"], "default": None},
-        {"name": "last_name",          "type": ["null", "string"], "default": None},
-        {"name": "email",              "type": ["null", "string"], "default": None},
-        {"name": "phone_number",       "type": ["null", "string"], "default": None},
-        {"name": "date_of_birth",      "type": ["null", "string"], "default": None},
-        {"name": "ip_address",         "type": ["null", "string"], "default": None},
-        {"name": "status",             "type": ["null", "string"], "default": None},
-        {"name": "transaction_id",     "type": ["null", "string"], "default": None},
-        {"name": "credit_card_number", "type": ["null", "string"], "default": None},
-        {"name": "iban",               "type": ["null", "string"], "default": None},
-        {"name": "routing_number",     "type": ["null", "string"], "default": None},
-        {"name": "account_number",     "type": ["null", "string"], "default": None},
-        {"name": "amount",             "type": ["null", "double"], "default": None},
-        {"name": "currency",           "type": ["null", "string"], "default": None},
-        {"name": "patient_id",         "type": ["null", "string"], "default": None},
-        {"name": "mrn",                "type": ["null", "string"], "default": None},
-        {"name": "diagnosis",          "type": ["null", "string"], "default": None},
-        {"name": "medication",         "type": ["null", "string"], "default": None},
-        {"name": "npi_number",         "type": ["null", "string"], "default": None},
-        {"name": "insurance_id",       "type": ["null", "string"], "default": None},
-        {"name": "comment",            "type": ["null", "string"], "default": None},
-        {"name": "applicant_name",     "type": ["null", "string"], "default": None},
-        {"name": "ssn",                "type": ["null", "string"], "default": None},
-        {"name": "passport_number",    "type": ["null", "string"], "default": None},
-        {"name": "driver_license",     "type": ["null", "string"], "default": None},
-        {"name": "nationality",        "type": ["null", "string"], "default": None},
-        {"name": "service",            "type": ["null", "string"], "default": None},
-        {"name": "username",           "type": ["null", "string"], "default": None},
-        {"name": "password",           "type": ["null", "string"], "default": None},
-        {"name": "api_key",            "type": ["null", "string"], "default": None},
-        {"name": "connection_string",  "type": ["null", "string"], "default": None},
-        {"name": "sample_id",          "type": ["null", "string"], "default": None},
-        {"name": "dna_sequence",       "type": ["null", "string"], "default": None},
-        {"name": "genome",             "type": ["null", "string"], "default": None},
-        {"name": "fingerprint",        "type": ["null", "string"], "default": None},
-        {"name": "facial_recognition", "type": ["null", "string"], "default": None},
-        {"name": "child_id",           "type": ["null", "string"], "default": None},
-        {"name": "guardian_email",     "type": ["null", "string"], "default": None},
-        {"name": "minor_data",         "type": ["null", "string"], "default": None},
-        {"name": "age",                "type": ["null", "int"],    "default": None},
-        {"name": "deal_id",            "type": ["null", "string"], "default": None},
-        {"name": "mnpi",               "type": ["null", "string"], "default": None},
-        {"name": "notes",              "type": ["null", "string"], "default": None},
-        {"name": "order_id",           "type": ["null", "string"], "default": None},
-        {"name": "cust_first_name",    "type": ["null", "string"], "default": None},
-        {"name": "cust_last_name",     "type": ["null", "string"], "default": None},
-        {"name": "cust_email",         "type": ["null", "string"], "default": None},
-        {"name": "cust_phone",         "type": ["null", "string"], "default": None},
-        {"name": "payment_cc_number",  "type": ["null", "string"], "default": None},
-        {"name": "billing_street",     "type": ["null", "string"], "default": None},
-        {"name": "billing_city",       "type": ["null", "string"], "default": None},
-        {"name": "billing_postal_code","type": ["null", "string"], "default": None},
-    ],
-})
-_ALL_FIELDS = [f["name"] for f in _AVRO_SCHEMA["fields"]]
+# ── Schema fetch from SR ─────────────────────────────────────────────────────
+# We never embed a schema literal here: the wire-format header gives us the
+# schema_id, and we fetch the parsed schema from SR (cached per-id).
+_SCHEMA_CACHE: dict[int, "fastavro.types.Schema"] = {}
 
 
-def _avro_decode(data: bytes) -> dict:
-    """Strip Confluent wire-format header (0x00 + 4-byte schema ID) then decode."""
+def _fetch_parsed_schema(sr_url: str, sr_key: str, sr_secret: str, schema_id: int):
+    """GET /schemas/ids/{id} from SR, parse with fastavro, cache."""
+    cached = _SCHEMA_CACHE.get(schema_id)
+    if cached is not None:
+        return cached
+    base = sr_url.rstrip("/")
+    auth = base64.b64encode(f"{sr_key}:{sr_secret}".encode()).decode()
+    req = urllib.request.Request(
+        f"{base}/schemas/ids/{schema_id}",
+        headers={"Authorization": f"Basic {auth}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"SR fetch for schema id={schema_id} failed: HTTP {e.code}: {e.read().decode()[:200]}"
+        ) from e
+    schema_str = body.get("schema")
+    if not schema_str:
+        raise RuntimeError(f"SR returned id={schema_id} but no 'schema' field")
+    parsed = fastavro.parse_schema(json.loads(schema_str))
+    _SCHEMA_CACHE[schema_id] = parsed
+    return parsed
+
+
+def _avro_decode(data: bytes, sr_url: str, sr_key: str, sr_secret: str) -> dict:
+    """Decode a Confluent Avro wire-format message: 0x00 | schema_id (BE32) | bytes.
+
+    Schema is fetched from SR by id (cached) — there is no local schema copy.
+    """
     if len(data) < 5 or data[0] != 0:
         raise ValueError("Not a Confluent Avro wire-format message")
+    schema_id = struct.unpack(">I", data[1:5])[0]
+    parsed = _fetch_parsed_schema(sr_url, sr_key, sr_secret, schema_id)
     buf = _io.BytesIO(data[5:])
-    return fastavro.schemaless_reader(buf, _AVRO_SCHEMA)
+    return fastavro.schemaless_reader(buf, parsed)
 
 
 def _avro_encode_result(result: dict, schema_id: int) -> bytes:
@@ -207,7 +183,8 @@ def classify_fields(classifier_url: str, max_layer: int, fields: dict) -> list:
     return results
 
 
-def run(bootstrap, api_key, api_secret, source_topic, classifier_url, max_layer, count):
+def run(bootstrap, api_key, api_secret, sr_url, sr_key, sr_secret,
+        source_topic, classifier_url, max_layer, count):
     kafka_conf = {
         "bootstrap.servers":  bootstrap,
         "security.protocol":  "SASL_SSL",
@@ -257,13 +234,14 @@ def run(bootstrap, api_key, api_secret, source_topic, classifier_url, max_layer,
             raw = msg.value()
 
             try:
-                record = _avro_decode(raw)
+                record = _avro_decode(raw, sr_url, sr_key, sr_secret)
             except Exception as e:
                 print(f"  [skip] msg {processed}: decode error: {e}", file=sys.stderr)
                 continue
 
-            # Classify
-            fields = {k: record[k] for k in _ALL_FIELDS if record.get(k) is not None}
+            # Classify — fields list comes from the decoded record itself
+            # (which mirrors the SR schema's fields), never a local copy.
+            fields = {k: v for k, v in record.items() if v is not None}
             results = classify_fields(classifier_url, max_layer, fields)
 
             if results:
@@ -307,9 +285,13 @@ def run(bootstrap, api_key, api_secret, source_topic, classifier_url, max_layer,
 
 def main():
     parser = argparse.ArgumentParser(description="Local end-to-end scanner (no Flink required)")
-    parser.add_argument("--bootstrap",       default=os.getenv("KAFKA_BOOTSTRAP"))
-    parser.add_argument("--api-key",         default=os.getenv("KAFKA_KEY"))
-    parser.add_argument("--api-secret",      default=os.getenv("KAFKA_SECRET"))
+    parser.add_argument("--bootstrap",       default=os.getenv("KAFKA_BOOTSTRAP") or os.getenv("CONFLUENT_BOOTSTRAP_SERVERS"))
+    parser.add_argument("--api-key",         default=os.getenv("KAFKA_KEY") or os.getenv("CONFLUENT_API_KEY"))
+    parser.add_argument("--api-secret",      default=os.getenv("KAFKA_SECRET") or os.getenv("CONFLUENT_API_SECRET"))
+    parser.add_argument("--sr-url",          default=os.getenv("SR_URL") or os.getenv("CONFLUENT_SR_URL"),
+                        help="SR base URL — required for decoding messages by their wire-format schema id")
+    parser.add_argument("--sr-key",          default=os.getenv("SR_KEY") or os.getenv("CONFLUENT_SR_API_KEY"))
+    parser.add_argument("--sr-secret",       default=os.getenv("SR_SECRET") or os.getenv("CONFLUENT_SR_API_SECRET"))
     parser.add_argument("--topic",           default=os.getenv("SOURCE_TOPIC", "raw-messages"))
     parser.add_argument("--classifier-url",  default=os.getenv("CLASSIFIER_URL", "http://localhost:8000"))
     parser.add_argument("--max-layer",       type=int, default=int(os.getenv("CLASSIFIER_MAX_LAYER", "3")))
@@ -321,6 +303,9 @@ def main():
         "--bootstrap":  args.bootstrap,
         "--api-key":    args.api_key,
         "--api-secret": args.api_secret,
+        "--sr-url":     args.sr_url,
+        "--sr-key":     args.sr_key,
+        "--sr-secret":  args.sr_secret,
     }.items() if not v]
     if missing:
         parser.error(f"Missing: {', '.join(missing)}")
@@ -329,6 +314,9 @@ def main():
         bootstrap      = args.bootstrap,
         api_key        = args.api_key,
         api_secret     = args.api_secret,
+        sr_url         = args.sr_url,
+        sr_key         = args.sr_key,
+        sr_secret      = args.sr_secret,
         source_topic   = args.topic,
         classifier_url = args.classifier_url,
         max_layer      = args.max_layer,

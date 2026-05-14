@@ -71,18 +71,63 @@ FLINK_FLAGS_GEO=(
     --region        "${CONFLUENT_CLOUD_REGION}"
 )
 
+# ── Generate the JSON_OBJECT field list from the live SR schema ───────────────
+# scan.sql contains a {json_object_fields} placeholder where the per-field
+# KEY/VALUE pairs go. We fetch the actual subject schema at submit time so
+# the scanner always tracks SR — no hand-edited field lists.
+JSON_OBJECT_FIELDS=""
+generate_json_object_fields() {
+    if [[ -n "${JSON_OBJECT_FIELDS}" ]]; then
+        return  # cached for this script run
+    fi
+    JSON_OBJECT_FIELDS=$(python3 "${SCRIPT_DIR}/generate_json_object.py" \
+        "${SR_URL}" "${SR_KEY}" "${SR_SECRET}" "${SOURCE_TOPIC}-value")
+    if [[ -z "${JSON_OBJECT_FIELDS}" ]]; then
+        echo "ERROR: generate_json_object.py returned empty — refusing to submit a scanner with no fields." >&2
+        exit 1
+    fi
+}
+
 # ── Substitute placeholders in SQL template ───────────────────────────────────
 resolve_sql() {
     local block="$1"
-    echo "${block}" \
-        | sed "s|{source_topic}|${SOURCE_TOPIC}|g" \
-        | sed "s|{scan_interval_minutes}|${SCAN_INTERVAL_MINUTES}|g" \
-        | sed "s|{sample_window_minutes}|${SAMPLE_WINDOW_MINUTES}|g" \
-        | sed "s|{classifier_url}|${CLASSIFIER_URL}|g" \
-        | sed "s|{max_layer}|${CLASSIFIER_MAX_LAYER}|g" \
-        | sed "s|{sr_url}|${SR_URL}|g" \
-        | sed "s|{sr_key}|${SR_KEY}|g" \
-        | sed "s|{sr_secret}|${SR_SECRET}|g"
+
+    # Only Statement C uses {json_object_fields}; generate lazily so the
+    # DDL/Statement A/B paths don't require SR connectivity.
+    if echo "${block}" | grep -q "{json_object_fields}"; then
+        generate_json_object_fields
+    fi
+
+    # Pass everything via env vars + stdin so backticks (in JSON_OBJECT
+    # field list) and other shell metachars don't get re-evaluated.
+    SQL_BLOCK="${block}" \
+    SOURCE_TOPIC="${SOURCE_TOPIC}" \
+    SCAN_INTERVAL_MINUTES="${SCAN_INTERVAL_MINUTES}" \
+    SAMPLE_WINDOW_MINUTES="${SAMPLE_WINDOW_MINUTES}" \
+    CLASSIFIER_URL="${CLASSIFIER_URL}" \
+    CLASSIFIER_MAX_LAYER="${CLASSIFIER_MAX_LAYER}" \
+    SR_URL="${SR_URL}" \
+    SR_KEY="${SR_KEY}" \
+    SR_SECRET="${SR_SECRET}" \
+    JSON_OBJECT_FIELDS="${JSON_OBJECT_FIELDS}" \
+    python3 <<'PYEOF'
+import os
+block = os.environ["SQL_BLOCK"]
+subs = {
+    "{source_topic}":          os.environ["SOURCE_TOPIC"],
+    "{scan_interval_minutes}": os.environ["SCAN_INTERVAL_MINUTES"],
+    "{sample_window_minutes}": os.environ["SAMPLE_WINDOW_MINUTES"],
+    "{classifier_url}":        os.environ["CLASSIFIER_URL"],
+    "{max_layer}":             os.environ["CLASSIFIER_MAX_LAYER"],
+    "{sr_url}":                os.environ["SR_URL"],
+    "{sr_key}":                os.environ["SR_KEY"],
+    "{sr_secret}":             os.environ["SR_SECRET"],
+    "{json_object_fields}":    os.environ["JSON_OBJECT_FIELDS"],
+}
+for k, v in subs.items():
+    block = block.replace(k, v)
+print(block)
+PYEOF
 }
 
 # Extract a named SQL block from the template (between two marker comment lines)
@@ -107,15 +152,26 @@ print("".join(buf).strip())
 PYEOF
 }
 
-# Submit a single long-running statement (idempotent — skips if already running)
+# Submit a single long-running statement. Always replaces the existing one
+# (delete + poll-until-gone + create) so the SQL stays in sync with the
+# current SR schema. Skip-if-exists left stale SQL in place after a schema
+# rebuild AND raced with CC's eventually-consistent describe.
 submit_statement() {
     local name="$1"
     local sql="$2"
 
-    if confluent flink statement describe "${name}" "${FLINK_FLAGS_GEO[@]}" &>/dev/null; then
-        echo "  [skip] ${name} already running"
-        return
-    fi
+    # Best-effort delete; ignore failure (statement may not exist).
+    confluent flink statement delete "${name}" "${FLINK_FLAGS_GEO[@]}" --force &>/dev/null || true
+
+    # Poll until describe reports the statement is gone — CC's control plane
+    # is eventually-consistent and `create` would fail with "already exists"
+    # if we proceed too eagerly.
+    for _ in $(seq 1 24); do  # up to ~60s
+        if ! confluent flink statement describe "${name}" "${FLINK_FLAGS_GEO[@]}" &>/dev/null; then
+            break
+        fi
+        sleep 2.5
+    done
 
     confluent flink statement create "${name}" \
         --sql "${sql}" \
@@ -169,7 +225,7 @@ VALUES ('manual', '${SOURCE_TOPIC}', CURRENT_TIMESTAMP);"
         echo "  Scan interval:   every ${SCAN_INTERVAL_MINUTES} minute(s)    [scheduled trigger]"
         echo "  Sample window:   last  ${SAMPLE_WINDOW_MINUTES} minute(s) per scan"
         echo "  Schema Registry: ${SR_URL}  [schema-evolution trigger]"
-        echo "  Classifier:      ${CLASSIFIER_URL}  (layer ${CLASSIFIER_MAX_LAYER})"
+        echo "  Classifier:      ${CLASSIFIER_URL}  (layer ${CLASSIFIER_MAX_LAYER}, via classifier-service connection)"
         echo ""
 
         # Step 1: create the two Kafka-backed tables (idempotent DDL via statement create)

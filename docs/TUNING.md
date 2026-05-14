@@ -43,10 +43,16 @@ curl -X POST http://localhost:8001/recommendations/bulk-approve \
 
 ### Flink scanner bulk-approve shortcut
 
-Edit the commented-out bulk-approve query in `sql/scan.sql`:
-```sql
-AND score >= 0.85   -- change to 0.90 for stricter auto-approval
+Pass `--yes` to `apply_tags.py` to approve all classifications without interactive prompting, or set a minimum confidence threshold:
+
+```bash
+# Auto-approve all (default min_confidence = 0 when using --yes)
+python flink-scanner/apply_tags.py --topic payments ... --yes
+
+# apply_tags.py shows HIGH/MEDIUM/LOW per classification — review LOW ones carefully
 ```
+
+To skip low-confidence results entirely, review interactively and press `n` for anything coloured red (LOW tier, score < 0.60).
 
 ### Recogniser-level score tuning
 

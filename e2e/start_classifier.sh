@@ -60,7 +60,12 @@ for i in $(seq 1 24); do
         echo ""
         echo "Next: open a NEW terminal tab and run:"
         echo "  ngrok http 8000"
-        echo "Copy the  https://xxxx.ngrok-free.app  URL — use it as CLASSIFIER_URL in scan.sql"
+        echo "Copy the  https://xxxx.ngrok-free.app  URL, then:"
+        echo "  1. Set CLASSIFIER_URL in flink-scanner/scan.env"
+        echo "  2. Update the classifier-service Flink connection endpoint:"
+        echo "     confluent flink connection update classifier-service \\"
+        echo "         --endpoint https://xxxx.ngrok-free.app \\"
+        echo "         --environment \$CONFLUENT_ENVIRONMENT --cloud aws --region us-west-2"
         echo ""
         echo "Press Ctrl+C here to stop the classifier."
         wait $UVICORN_PID

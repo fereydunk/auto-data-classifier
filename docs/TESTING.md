@@ -5,19 +5,27 @@
 ```
 tests/
 ├── conftest.py                      sys.path setup for classifier-service + kafka-pipeline
-├── test_classifier_api.py           /classify and /health endpoint tests (13 tests)
-├── test_field_name_recognizer.py    Layer 1 — classify_field_name() + is_free_text() (37 tests)
-├── test_taxonomy.py                 DataTag enum + tag_entity() (12 tests)
+├── test_classifier_api.py           /classify and /health endpoint tests
+├── test_field_name_recognizer.py    Layer 1 — classify_field_name() + is_free_text()
+├── test_taxonomy.py                 DataTag enum + tag_entity()
 ├── test_phi_recognizers.py          PHI pattern recognisers
 ├── test_pci_recognizers.py          PCI pattern recognisers
 ├── test_financial_recognizers.py    FINANCIAL pattern recognisers
 ├── test_credentials_recognizers.py  CREDENTIALS pattern recognisers
-├── test_catalog_tagger.py           Stream Catalog tag application logic
-├── test_review_api.py               Review API — create, upsert, approve, reject, bulk (23 tests)
+├── test_catalog_tagger.py           kafka-pipeline catalog tagger + new SR field-validation gate
+├── test_review_api.py               Review API — create, upsert, approve/stage/reject, bulk,
+│                                    submit-staged auto-rejection of stale rows,
+│                                    validate-staged endpoint, DELETE by topic
+├── test_sr_schema.py                Avro field-path extractor + record-qualifier helpers,
+│                                    schema-fetch + 60-s TTL cache
+├── test_schema_builder.py           Dynamic schema generation from setup_wizard.field_pool
+├── test_generate_json_object.py     Flink scan.sql JSON_OBJECT generator (top-level field listing)
+├── test_setup_wizard.py             Wizard helpers (env parsing, region detection, dynamic schema,
+│                                    field-pool generators)
 └── test_wire_format.py              Confluent Avro wire-format deserialization
 ```
 
-**Total: 222 tests. All pass.**
+**Total: 298 tests. All pass.**
 
 ---
 
@@ -188,13 +196,12 @@ Produces 200 JSON messages covering all 11 tag types including nested structures
 
 ### Step 5 — Run the Flink SQL scanner
 
-> **Network constraint:** Confluent Cloud Flink compute pools have no outbound internet access.
-> The `classify_fields()` UDF cannot call an external classifier URL from inside the pool.
-> Statements A (scheduled trigger) and B (schema-evolution trigger) run correctly.
-> Statement C (scan driver) runs but the UDF silently produces no rows.
->
-> Use `local_scanner.py` (Step 5b) as the classification path until the
-> **USING CONNECTIONS** Early Access feature is enabled for your org.
+> **Prerequisite — USING CONNECTIONS must be enabled for your org:**
+> Confluent Cloud Flink internet egress for UDFs requires the **USING CONNECTIONS** feature to be
+> enabled for your Confluent Cloud organisation by the Confluent account team. Without it,
+> `classify_fields()` cannot reach external URLs. Verify with:
+> `confluent flink connection list --environment <env-id> --cloud aws --region us-west-2`
+> If the `classifier-service` connection is present, the feature is active.
 
 ```bash
 # 1. Build the UDF JAR
@@ -202,33 +209,47 @@ bash flink-scanner/scripts/build.sh
 
 # 2. Register all three UDFs in Confluent Cloud (once per environment)
 bash flink-scanner/scripts/register.sh
-# Registers: classify_fields(), schema_watcher(), apply_tag()
+# Registers: classify_fields() (USING CONNECTIONS classifier-service), schema_watcher(), apply_tag()
 # (requires CONFLUENT_ENVIRONMENT and CONFLUENT_COMPUTE_POOL set, or export before running)
 
 # 3. Fill in flink-scanner/scan.env with your credentials and schedule
 vim flink-scanner/scan.env
 #   SCAN_INTERVAL_MINUTES=2    ← short for testing; use 60 for production
 #   SAMPLE_WINDOW_MINUTES=1    ← how much data per scan
-#   SOURCE_TOPIC, CLASSIFIER_URL, SR_URL/KEY/SECRET, KAFKA_BOOTSTRAP/KEY/SECRET
+#   CLASSIFIER_URL             ← must match the classifier-service connection endpoint
+#   SOURCE_TOPIC, SR_URL/KEY/SECRET, KAFKA_BOOTSTRAP/KEY/SECRET
 
 # 4. Start all three Flink statements (run once — they run continuously)
 bash flink-scanner/scripts/start_scan.sh
 # Starts:
 #   {topic}-scan-trigger-scheduled  RUNNING — TUMBLE window, fires every N min
 #   {topic}-scan-trigger-schema     RUNNING — SchemaWatcherUDF, reacts to SR changes
-#   {topic}-scan-driver             RUNNING — interval join ready; UDF no-ops (see above)
+#   {topic}-scan-driver             RUNNING — interval join + classify_fields() via USING CONNECTIONS
 
-# 5. Check status
+# 5. Trigger a manual scan (inserts one row; scan driver reacts immediately)
+bash flink-scanner/scripts/start_scan.sh --now
+# Fire a second trigger ~60s later to advance the watermark and unblock the interval join:
+bash flink-scanner/scripts/start_scan.sh --now
+
+# 6. Check status
 bash flink-scanner/scripts/start_scan.sh --status
 
 # Stop all scanner statements
 bash flink-scanner/scripts/start_scan.sh --stop
 ```
 
-### Step 5b — Classify with local_scanner.py (current E2E path)
+Expected results in `{topic}-scan-results` after two manual triggers over 200 test messages:
+```
+~1,874 rows — one per (field_path, tag) detection
+All 11 tags represented: PII, PHI, PCI, CREDENTIALS, FINANCIAL, GOVERNMENT_ID,
+                          BIOMETRIC, GENETIC, NPI, LOCATION, MINOR
+```
 
-`local_scanner.py` replicates Statement C's logic locally. It produces to the same
-`{topic}-scan-results` topic that `apply_tags.py` reads — the rest of the pipeline is identical.
+### Step 5b — Classify with local_scanner.py (fallback path)
+
+Use `local_scanner.py` only if USING CONNECTIONS is **not** enabled for your org.
+It replicates Statement C's logic locally, writing to the same `{topic}-scan-results` topic.
+`apply_tags.py` handles results from both paths identically (Avro from Flink, JSON from local scanner).
 
 ```bash
 source flink-scanner/scan.env
@@ -250,7 +271,7 @@ python e2e/local_scanner.py \
   --count           200
 
 # Expected output:
-#   250/200 messages processed  (1987 tag detections so far)
+#   200/200 messages processed  (1987 tag detections so far)
 #   Done. Processed 200 messages → 1987 tag detections.
 #   Tag summary:
 #     PII                   966
@@ -303,14 +324,54 @@ python flink-scanner/apply_tags.py ... --yes
 - No duplicate entity types per field
 - `is_free_text()`: known names, structured names, value word-count heuristic
 
-### test_review_api.py (23 tests)
+### test_review_api.py (39 tests)
 - Create recommendation, retrieve by ID
 - Upsert keeps highest confidence for same (topic, field, tag)
 - List with status/topic/tag/tier filters
-- Approve → calls catalog_client, status → APPROVED
-- Reject → status → REJECTED
-- Bulk-approve above min_confidence threshold
+- Approve moves PENDING → STAGED (no catalog push at this point)
+- Unstage moves STAGED back to PENDING; rejects PENDING with 409
+- Reject works from PENDING and STAGED; refuses APPROVED with 409
+- Bulk-approve above min_confidence threshold (stages, then submit-staged pushes batch)
+- Submit-staged: empty queue → 200 + []; success path flips every STAGED → APPROVED
+- Submit-staged auto-rejects items whose `field_path` is no longer in the live SR schema,
+  with `reviewed_by="auto: field not in current SR schema"`
+- Submit-staged returns 503 when CONFLUENT_SR_* env vars are missing
+- Validate-staged returns `{checked, valid, stale}` and 503 when SR not configured
 - Summary counts by topic
+- Sources endpoint returns `(topic, subject, version, schema_id, count)` per topic
+- DELETE /recommendations?topic=X wipes only that topic; refuses missing topic with 400
+
+### test_sr_schema.py (18 tests)
+- Avro field-path extraction: simple records, nested records, arrays, maps, unions
+- Record qualifier extraction (`{namespace}.{record_name}` from schema body)
+- Schema-fetch happy/sad paths (HTTP 200, 404, network error → fail-closed None)
+- 60-s TTL cache hit/miss/expiry; `_clear_cache_for_tests()` resets state
+
+### test_schema_builder.py (18 tests)
+- `build_demo_schema(N)` produces a valid Avro record with N nullable fields
+- Category balance: priority categories (PII, GOVERNMENT_ID, PCI, …) seen first
+- Bounds: `MIN_FIELDS` ≤ N ≤ `MAX_FIELDS`; raises ValueError outside
+- Deterministic when given a seeded `random.Random`; fresh schema per call
+
+### test_generate_json_object.py (11 tests)
+- Top-level field listing from a record schema (skips nested fields by design)
+- Renders KEY/VALUE block with 16-space indent matching scan.sql formatting
+- Rejects non-AVRO `schemaType` (exit 3); rejects non-record top-level (exit 4)
+- Rejects empty field list; usage error (exit 1) on bad argv
+
+### test_catalog_tagger.py (26 tests)
+- `apply_tags_batch` flat-shape payload to `/catalog/v1/entity/tags`
+- SR field-validation gate drops items whose path isn't in the live schema and returns
+  them in the `dropped` list with a reason
+- Tag-definitions are POSTed once and cached (subsequent submits skip the GET)
+- Cryptic Atlas 400 ("Type ENTITY with name null does not exist") is translated into
+  a useful error message naming the offending subject + field path
+- `_clear_sr_cache` autouse fixture prevents cache leak across tests
+
+### test_setup_wizard.py (10 tests)
+- `_parse_kafka_region` strips `SASL_SSL://` prefix the newer CLI returns
+- `_read_env_value` regex uses `[ \t]` not `\s` to avoid swallowing newlines
+- Env-pick + region detection helpers; field-pool sample callables produce realistic values
 
 ---
 

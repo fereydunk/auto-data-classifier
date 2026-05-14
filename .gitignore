@@ -26,3 +26,11 @@ flink-scanner/dependency-reduced-pom.xml
 .idea/
 .vscode/
 *.DS_Store
+flink-scanner/scan.env
+
+# Per-env scan state files written by the setup wizard / provisioner
+flink-scanner/demo_*_state_*.json
+flink-scanner/demo_*_consumers_*.pids
+
+# Subprocess logs from setup_wizard (classifier, ngrok, results-bridge)
+scripts/logs/

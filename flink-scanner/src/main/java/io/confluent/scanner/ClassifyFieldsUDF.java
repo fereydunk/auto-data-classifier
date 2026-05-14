@@ -25,6 +25,11 @@ import java.util.Map;
  * (field_path, tag) pair — always keeping the highest-confidence entity
  * per pair across all three layers.
  *
+ * Registered with: USING CONNECTIONS (`classifier-service`)
+ * The connection provides network egress to the classifier endpoint.
+ * The URL is still passed as a SQL parameter so it can be updated without
+ * rebuilding the JAR.
+ *
  * SQL usage:
  *   LATERAL TABLE(classify_fields(
  *       'https://classifier.example.com',  -- classifier service URL

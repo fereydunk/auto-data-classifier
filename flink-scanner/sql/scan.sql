@@ -13,28 +13,10 @@
 -- One unified scan driver reads every trigger, classifies the last M minutes
 -- of source data, and writes results to {topic}-scan-results.
 --
--- ── Network egress constraint ────────────────────────────────────────────────
--- Confluent Cloud Flink compute pools have NO outbound internet access.
--- classify_fields() calls POST /classify on an external URL; those HTTP calls
--- silently time out inside the UDF — Statement C runs but emits zero rows.
--- Statements A and B are unaffected (A uses native Flink; B calls SR internally).
---
--- Workaround: use e2e/local_scanner.py, which runs the same classify → publish
--- logic locally and writes to the same {topic}-scan-results topic.
--- apply_tags.py reads that topic identically regardless of which path wrote it.
---
--- Future — USING CONNECTIONS (Early Access):
--- Once enabled for your org, re-register classify_fields with:
---   CREATE FUNCTION classify_fields
---     AS 'io.confluent.scanner.ClassifyFieldsUDF'
---     USING JAR 'confluent-artifact://<artifact-id>'
---     USING CONNECTIONS (`classifier-service`);
--- The Connection object is created with:
---   confluent flink connection create classifier-service \
---     --type rest --endpoint https://your-classifier.example.com
--- After that, Statement C works end-to-end with no local scanner needed.
--- See flink-scanner/scripts/register.sh for the exact command (commented out).
--- ─────────────────────────────────────────────────────────────────────────────
+-- classify_fields() calls POST /classify via the 'classifier-service' Flink
+-- connection (USING CONNECTIONS). Network egress is provided by the connection;
+-- the URL is still passed as a SQL parameter so it can be updated without
+-- rebuilding the JAR.
 --
 -- Placeholders replaced by start_scan.sh at submit time:
 --   {source_topic}           e.g. raw-messages
@@ -123,6 +105,9 @@ FROM
 -- For each trigger, interval-joins with the source topic to fetch messages
 -- from the last SAMPLE_WINDOW_MINUTES, classifies them, and writes results.
 --
+-- classify_fields calls the classifier via the 'classifier-service' connection
+-- (network egress provided by USING CONNECTIONS). URL still passed as parameter.
+--
 -- The interval join condition:
 --   p.$rowtime BETWEEN t.triggered_at - INTERVAL 'M' MINUTES AND t.triggered_at
 -- pulls only the messages that arrived in the sample window before the trigger.
@@ -149,59 +134,11 @@ JOIN
             '{classifier_url}',
             {max_layer},
             -- Reconstruct the message as a JSON string from the Avro columns.
-            -- Null fields are included as JSON null; the classifier skips them.
+            -- The KEY/VALUE list is GENERATED at start_scan time from the
+            -- live SR schema for `{source_topic}-value` (see
+            -- scripts/generate_json_object.py). Never edit this list by hand.
             JSON_OBJECT(
-                KEY 'customer_id'         VALUE p.`customer_id`,
-                KEY 'first_name'          VALUE p.`first_name`,
-                KEY 'last_name'           VALUE p.`last_name`,
-                KEY 'email'               VALUE p.`email`,
-                KEY 'phone_number'        VALUE p.`phone_number`,
-                KEY 'date_of_birth'       VALUE p.`date_of_birth`,
-                KEY 'ip_address'          VALUE p.`ip_address`,
-                KEY 'status'              VALUE p.`status`,
-                KEY 'transaction_id'      VALUE p.`transaction_id`,
-                KEY 'credit_card_number'  VALUE p.`credit_card_number`,
-                KEY 'iban'                VALUE p.`iban`,
-                KEY 'routing_number'      VALUE p.`routing_number`,
-                KEY 'account_number'      VALUE p.`account_number`,
-                KEY 'currency'            VALUE p.`currency`,
-                KEY 'patient_id'          VALUE p.`patient_id`,
-                KEY 'mrn'                 VALUE p.`mrn`,
-                KEY 'diagnosis'           VALUE p.`diagnosis`,
-                KEY 'medication'          VALUE p.`medication`,
-                KEY 'npi_number'          VALUE p.`npi_number`,
-                KEY 'insurance_id'        VALUE p.`insurance_id`,
-                KEY 'comment'             VALUE p.`comment`,
-                KEY 'applicant_name'      VALUE p.`applicant_name`,
-                KEY 'ssn'                 VALUE p.`ssn`,
-                KEY 'passport_number'     VALUE p.`passport_number`,
-                KEY 'driver_license'      VALUE p.`driver_license`,
-                KEY 'nationality'         VALUE p.`nationality`,
-                KEY 'service'             VALUE p.`service`,
-                KEY 'username'            VALUE p.`username`,
-                KEY 'password'            VALUE p.`password`,
-                KEY 'api_key'             VALUE p.`api_key`,
-                KEY 'connection_string'   VALUE p.`connection_string`,
-                KEY 'sample_id'           VALUE p.`sample_id`,
-                KEY 'dna_sequence'        VALUE p.`dna_sequence`,
-                KEY 'genome'              VALUE p.`genome`,
-                KEY 'fingerprint'         VALUE p.`fingerprint`,
-                KEY 'facial_recognition'  VALUE p.`facial_recognition`,
-                KEY 'child_id'            VALUE p.`child_id`,
-                KEY 'guardian_email'      VALUE p.`guardian_email`,
-                KEY 'minor_data'          VALUE p.`minor_data`,
-                KEY 'deal_id'             VALUE p.`deal_id`,
-                KEY 'mnpi'                VALUE p.`mnpi`,
-                KEY 'notes'               VALUE p.`notes`,
-                KEY 'order_id'            VALUE p.`order_id`,
-                KEY 'cust_first_name'     VALUE p.`cust_first_name`,
-                KEY 'cust_last_name'      VALUE p.`cust_last_name`,
-                KEY 'cust_email'          VALUE p.`cust_email`,
-                KEY 'cust_phone'          VALUE p.`cust_phone`,
-                KEY 'payment_cc_number'   VALUE p.`payment_cc_number`,
-                KEY 'billing_street'      VALUE p.`billing_street`,
-                KEY 'billing_city'        VALUE p.`billing_city`,
-                KEY 'billing_postal_code' VALUE p.`billing_postal_code`
+{json_object_fields}
             )
         )
     ) AS c;

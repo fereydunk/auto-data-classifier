@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Set
 
 import httpx
 
+from sr_schema import fetch_field_paths_cached, fetch_schema_meta_cached
+
 logger = logging.getLogger("catalog_tagger")
 
 SR_FIELD_TYPE = "sr_field"
@@ -67,12 +69,13 @@ _CATEGORY_PRIORITY = [
 ]
 
 
-def _field_qualified_name(sr_cluster_id: str, subject: str, version: int, field_path: str) -> str:
+def _field_qualified_name(
+    sr_cluster_id: str, schema_id: int, record_qualifier: str, field_path: str,
+) -> str:
+    """Build the Confluent Stream Catalog qualified name for an sr_field entity.
+    Format: {cluster_id}:.:{schema_id}:{namespace}.{record_name}.{field_path}
     """
-    Build the Confluent Stream Catalog qualified name for an sr_field entity.
-    Format: {sr_cluster_id}:.:{subject}.v{version}.{field_path}
-    """
-    return f"{sr_cluster_id}:.:{subject}.v{version}.{field_path}"
+    return f"{sr_cluster_id}:.:{schema_id}:{record_qualifier}.{field_path}"
 
 
 def extract_schema_id_from_wire(raw: bytes) -> Optional[int]:
@@ -186,23 +189,40 @@ class CatalogTagger:
         if cache_key in self._tagged:
             return
 
+        # SR is the source of truth: never POST a tag for a field that
+        # isn't in the live registered schema. Fail closed if we can't
+        # read the schema (Atlas would otherwise return the cryptic
+        # "Type ENTITY with name null" error and the whole pipeline
+        # would log noise on every message).
+        clean_path = field_path.replace("[", ".").replace("]", "").strip(".")
+        valid_paths = await fetch_field_paths_cached(
+            client, self._base_url, self._auth, subject, version
+        )
+        sid, record_qualifier = await fetch_schema_meta_cached(
+            client, self._base_url, self._auth, subject, version
+        )
+        if not valid_paths or sid is None or not record_qualifier:
+            logger.warning(
+                "Skipping tag — could not fetch/parse SR schema for '%s' v%d (field=%s)",
+                subject, version, field_path,
+            )
+            return
+        if clean_path not in valid_paths:
+            logger.warning(
+                "Skipping tag — field '%s' not in SR schema for '%s' v%d",
+                clean_path, subject, version,
+            )
+            return
+
         qualified_name = _field_qualified_name(
-            self._sr_cluster_id, subject, version, field_path
+            self._sr_cluster_id, sid, record_qualifier, clean_path
         )
 
         payload = [
             {
-                "typeName": SR_FIELD_TYPE,
-                "attributes": {"qualifiedName": qualified_name},
-                "classifications": [
-                    {
-                        "typeName": tag_name,
-                        "attributes": {
-                            "entity_types": ", ".join(entity_types),
-                            "classified_by": f"auto-classifier-v{self._classifier_version}",
-                        },
-                    }
-                ],
+                "entityType": SR_FIELD_TYPE,
+                "entityName": qualified_name,
+                "typeName": tag_name,
             }
         ]
 
