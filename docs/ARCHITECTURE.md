@@ -606,15 +606,15 @@ before submitting Statement C.
 
 ## Validated E2E results (Confluent Cloud, April 2026)
 
-The full pipeline was validated end-to-end against a live Confluent Cloud environment with USING CONNECTIONS enabled:
+The full pipeline was validated end-to-end against a live Confluent Cloud environment with USING CONNECTIONS enabled. The validation infrastructure (DEVTEST env Kafka cluster, Flink compute pool, all credentials) was torn down on 2026-05-14 — the results below are preserved as evidence the pipeline works against real CC; re-running requires re-provisioning via the wizard.
 
-| Resource | Value |
+| Resource | Value (at validation time, no longer exists) |
 |---|---|
-| Environment | DEVTEST (env-m2qxq) |
-| Flink compute pool | lfcp-dw3qy7 (us-west-2, AWS) |
-| Kafka cluster | lkc-1j6rd3 (us-west-2, AWS) |
-| Schema Registry | psrc-lq3wm (eu-central-1, AWS) |
-| Flink connection | classifier-service → ngrok tunnel → localhost:8000 |
+| Environment | DEVTEST (env-m2qxq) — env still exists |
+| Flink compute pool | lfcp-dw3qy7 (us-west-2, AWS) — **deleted 2026-05-14** |
+| Kafka cluster | lkc-1j6rd3 / pkc-pgq85 (us-west-2, AWS) — **deleted 2026-05-14** |
+| Schema Registry | psrc-lq3wm (eu-central-1, AWS) — env-scoped, retained |
+| Flink connection | classifier-service → ngrok tunnel → localhost:8000 (still registered, ngrok URL stale) |
 | Source topic | raw-messages |
 | Result topic | raw-messages-scan-results |
 
