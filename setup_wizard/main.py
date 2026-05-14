@@ -375,8 +375,23 @@ def _write_demo_config(*, env_id: str, env_name: str,
                        sr: dict, sr_key_secret: tuple[str, str],
                        kafka_key_secret: tuple[str, str],
                        source_topic: str) -> dict:
-    """Populate both .env and flink-scanner/scan.env from one selection."""
+    """Populate both .env and flink-scanner/scan.env from one selection.
+
+    Every field that depends on the chosen cluster — bootstrap, key, secret,
+    cluster_id, region — is rewritten in BOTH files in this single call. If
+    the user later re-picks a different env in Card 3, this gets called
+    again and overwrites everything atomically. The earlier bug: scan.env's
+    KAFKA_BOOTSTRAP / KAFKA_KEY / KAFKA_SECRET were never written here, so
+    re-picking a new cluster would update CONFLUENT_KAFKA_CLUSTER in scan.env
+    but leave a STALE bootstrap+key from a prior (possibly deleted) cluster,
+    silently breaking apply_tags.py and any external Kafka client reading
+    scan.env.
+    """
     bootstrap   = cluster.get("endpoint", "") or cluster.get("bootstrap", "") or ""
+    # Strip SASL_SSL:// for tools that want bare host:port (apply_tags.py,
+    # librdkafka helpers in scan.env consumers). .env keeps the raw endpoint
+    # form because that's what existing consumers (kafka-pipeline) accept.
+    bootstrap_bare = bootstrap.split("://", 1)[1] if "://" in bootstrap else bootstrap
     cloud, region = _parse_kafka_region(bootstrap)
     cluster_id  = cluster.get("id", "")
     pool_id     = flink_pool.get("id", "")
@@ -398,7 +413,7 @@ def _write_demo_config(*, env_id: str, env_name: str,
         "REVIEW_API_URL":              "http://localhost:8001",
     }, header="# Written by setup-wizard. Edit MAX_LAYER / BATCH_SIZE / etc. by hand.\n")
 
-    # flink-scanner/scan.env — read by flink-scanner/scripts/*.sh
+    # flink-scanner/scan.env — read by flink-scanner/scripts/*.sh and apply_tags.py
     _upsert_env_values(SCAN_ENV_FILE, {
         "CONFLUENT_ENVIRONMENT":    env_id,
         "CONFLUENT_KAFKA_CLUSTER":  cluster_id,
@@ -406,6 +421,13 @@ def _write_demo_config(*, env_id: str, env_name: str,
         "CONFLUENT_CLOUD_PROVIDER": cloud,
         "CONFLUENT_CLOUD_REGION":   region,
         "SOURCE_TOPIC":             source_topic,
+        # Kafka — needed by apply_tags.py (consumes scan-results) and any
+        # external operator running flink-scanner scripts directly. MUST be
+        # rewritten on every env-pick or stale values from a prior cluster
+        # leak through.
+        "KAFKA_BOOTSTRAP":          bootstrap_bare,
+        "KAFKA_KEY":                kafka_key,
+        "KAFKA_SECRET":             kafka_secret,
         "SR_URL":                   sr_url,
         "SR_KEY":                   sr_user_key,
         "SR_SECRET":                sr_user_secret,

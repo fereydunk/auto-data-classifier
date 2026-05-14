@@ -74,7 +74,6 @@
       <table class="w-full text-sm">
         <thead class="bg-slate-50 text-slate-600 uppercase text-xs tracking-wider">
           <tr>
-            <th class="px-4 py-3 text-left">Topic</th>
             <th class="px-4 py-3 text-left">Field path</th>
             <th class="px-4 py-3 text-left">Proposed tag</th>
             <th class="px-4 py-3 text-left">Confidence</th>
@@ -83,7 +82,7 @@
           </tr>
         </thead>
         <tbody id="rec-tbody" class="divide-y divide-slate-100">
-          <tr><td colspan="6" class="px-4 py-12 text-center text-slate-400">Loading…</td></tr>
+          <tr><td colspan="5" class="px-4 py-12 text-center text-slate-400">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -106,7 +105,6 @@
       <table class="w-full text-sm">
         <thead class="bg-indigo-50 text-slate-600 uppercase text-xs tracking-wider">
           <tr>
-            <th class="px-4 py-2 text-left">Topic</th>
             <th class="px-4 py-2 text-left">Field</th>
             <th class="px-4 py-2 text-left">Tag</th>
             <th class="px-4 py-2 text-left">Confidence</th>
@@ -207,7 +205,6 @@
 
       return `
         <tr class="row-fade hover:bg-slate-50" data-id="${rec.id}">
-          <td class="px-4 py-3 font-mono text-xs text-slate-700">${escapeHtml(rec.topic)}</td>
           <td class="px-4 py-3 font-mono text-xs">${escapeHtml(rec.field_path)}</td>
           <td class="px-4 py-3 font-semibold text-indigo-700">${escapeHtml(rec.proposed_tag)}
             <span class="block text-xs font-normal text-slate-500">${escapeHtml(rec.entity_type)}${rec.is_free_text ? " · free text" : ""}</span>
@@ -249,7 +246,7 @@
         loadSources();
 
         if (recs.length === 0) {
-          tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-12 text-center text-slate-400">
+          tbody.innerHTML = `<tr><td colspan="5" class="px-4 py-12 text-center text-slate-400">
             No ${currentStatus.toLowerCase()} recommendations${currentTag ? " match your filters" : ""}.
           </td></tr>`;
           return;
@@ -257,7 +254,7 @@
 
         tbody.innerHTML = recs.map(renderRow).join("");
       } catch (err) {
-        tbody.innerHTML = `<tr><td colspan="6" class="px-4 py-12 text-center text-rose-500">
+        tbody.innerHTML = `<tr><td colspan="5" class="px-4 py-12 text-center text-rose-500">
           Failed to load recommendations: ${escapeHtml(err.message)}
         </td></tr>`;
       }
@@ -330,7 +327,6 @@
             : escapeHtml(r.field_path);
           return `
             <tr data-id="${r.id}" class="${rowClass}">
-              <td class="px-4 py-2 font-mono text-xs text-slate-600">${escapeHtml(r.topic)}</td>
               <td class="px-4 py-2 font-mono text-xs">${fieldCell}</td>
               <td class="px-4 py-2 font-semibold text-indigo-700">${escapeHtml(r.proposed_tag)}
                 <span class="block text-xs font-normal text-slate-500">${escapeHtml(r.entity_type)}</span>
