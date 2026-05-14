@@ -49,6 +49,11 @@ CREATE FUNCTION IF NOT EXISTS classify_fields
     USING JAR 'confluent-artifact://${ARTIFACT_ID}'
     LANGUAGE JAVA;
 
+CREATE FUNCTION IF NOT EXISTS schema_watcher
+    AS 'io.confluent.scanner.SchemaWatcherUDF'
+    USING JAR 'confluent-artifact://${ARTIFACT_ID}'
+    LANGUAGE JAVA;
+
 CREATE FUNCTION IF NOT EXISTS apply_tag
     AS 'io.confluent.scanner.ApplyTagUDF'
     USING JAR 'confluent-artifact://${ARTIFACT_ID}'
@@ -61,6 +66,7 @@ SQL
 echo ""
 echo "Done. UDFs registered:"
 echo "  classify_fields(classifier_url STRING, max_layer INT, message STRING)"
+echo "  schema_watcher(sr_url STRING, sr_key STRING, sr_secret STRING, subject STRING)"
 echo "  apply_tag(sr_url, sr_key, sr_secret, cluster_id, subject, field_path, tag)"
 echo ""
-echo "Open sql/scan.sql in the Flink SQL workspace to start scanning."
+echo "Run ./scripts/start_scan.sh to start all three trigger statements."

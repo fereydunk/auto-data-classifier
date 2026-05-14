@@ -143,17 +143,44 @@ GLiNER loads the model into memory once per process (~500 MB). Each replica need
 
 ---
 
-## Flink scanner — window sizing
+## Flink scanner — schedule and window sizing
 
-The N-minute window in `scan.sql` is a tradeoff between:
+Both parameters live in `flink-scanner/scan.env`. Change either and restart with `start_scan.sh`.
+
+```
+SCAN_INTERVAL_MINUTES=60    # TUMBLE window size — how often Statement A fires
+SAMPLE_WINDOW_MINUTES=2     # interval join lookback — how much data Statement C classifies
+```
+
+These are independent:
+- Increasing `SCAN_INTERVAL_MINUTES` reduces Flink compute cost (fewer classification runs)
+- Increasing `SAMPLE_WINDOW_MINUTES` improves sample coverage per run but increases UDF calls
+
+### Choosing SAMPLE_WINDOW_MINUTES
+
+The sample window is a tradeoff between coverage and cost:
 
 | Shorter window | Longer window |
 |---|---|
 | Less representative sample | More representative sample |
-| Fewer messages, faster results | More messages, catches rare field combinations |
-| Better for fast-moving topics | Better for low-volume topics |
+| Fewer messages, lower cost | More messages, higher cost |
+| Better for high-volume topics | Better for low-volume topics |
 
-**Rule of thumb:** aim for 500–2000 unique messages in the sample. For a topic doing 1000 msg/min, 1–2 minutes is sufficient. For a topic doing 10 msg/min, use 10–15 minutes.
+**Rule of thumb:** aim for 500–2,000 unique messages per scan window. For a topic doing 1,000 msg/min, 1–2 minutes is sufficient. For a topic doing 10 msg/min, use 10–15 minutes.
+
+### Schema-evolution trigger timing
+
+The `schema_watcher()` UDF checks Schema Registry at most once per minute regardless of topic message rate. This means a schema change will be detected and trigger a scan within 1 minute of the schema registration.
+
+### Three trigger types and when they fire
+
+| Trigger | When | Statement |
+|---|---|---|
+| Scheduled | Every `SCAN_INTERVAL_MINUTES` | A (TUMBLE) |
+| Schema evolution | Within 1 min of SR version change | B (schema_watcher UDF) |
+| Manual | Immediately on `start_scan.sh --now` | one-shot INSERT |
+
+All three write to the same `{topic}-scan-triggers` topic. Statement C (scan driver) reacts to each one identically.
 
 ---
 

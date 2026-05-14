@@ -5,9 +5,9 @@
 The auto data classifier has two operating modes that share the same classification engine:
 
 1. **Streaming pipeline** — continuously classifies every message on a Kafka topic
-2. **Flink SQL scanner** — on-demand interactive profiling with human approval in the Flink workspace
+2. **Flink SQL scanner** — scheduled + event-driven topic profiling with human approval via apply_tags.py
 
-Both modes use the same three-layer classifier and write tags to the same Confluent Stream Catalog.
+Both modes use the same three-layer classifier. The Flink scanner writes tags directly to the Schema Registry schema definition.
 
 ---
 
@@ -17,19 +17,23 @@ Both modes use the same three-layer classifier and write tags to the same Conflu
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        Confluent Cloud                                  │
 │                                                                         │
-│  Kafka Topics                        Stream Catalog (Schema Registry)   │
-│  ┌──────────────────┐                ┌────────────────────────────────┐ │
-│  │ raw-messages     │                │ payments-value                 │ │
-│  │ classified-msgs  │                │   customer.email  → PII        │ │
-│  │ classified-safe  │                │   card.number     → PCI        │ │
-│  │ classification-  │                │   patient_id      → PHI        │ │
-│  │   audit          │                └────────────────────────────────┘ │
-│  └──────────────────┘                                                   │
-│          │                  Flink SQL Workspace                         │
+│  Kafka Topics                        Schema Registry                    │
+│  ┌──────────────────────┐            ┌────────────────────────────────┐ │
+│  │ {topic}              │            │ {topic}-value  v2              │ │
+│  │ {topic}-scan-triggers│            │   customer.email               │ │
+│  │ {topic}-scan-results │            │     "confluent:tags": ["PII"]  │ │
+│  │ raw-messages         │            │   card.number                  │ │
+│  │ classified-msgs      │            │     "confluent:tags": ["PCI"]  │ │
+│  │ classified-safe      │            └────────────────────────────────┘ │
+│  │ classification-audit │                         ▲                     │
+│  └──────────────────────┘                         │ register new version│
+│          │                                        │                     │
+│          │                  Flink SQL (3 statements)                    │
 │          │                  ┌──────────────────────────────────────┐    │
-│          │                  │  classify_fields() UDTF              │    │
-│          │                  │  apply_tag() scalar UDF              │    │
-│          │                  │  sql/scan.sql template               │    │
+│          │                  │  A: TUMBLE → scan-triggers           │    │
+│          ├─────────────────▶│  B: schema_watcher() → scan-triggers │    │
+│          │                  │  C: scan driver → scan-results        │    │
+│          │                  │     (classify_fields() UDTF)          │    │
 │          │                  └──────────────────────────────────────┘    │
 └──────────┼──────────────────────────────────────────────────────────────┘
            │
@@ -44,24 +48,20 @@ Both modes use the same three-layer classifier and write tags to the same Conflu
 │  │ route_message()          │     │       approve                    │  │
 │  │ post_recommendations()   │     │ POST /recommendations/{id}/      │  │
 │  └──────────────────────────┘     │       approve | reject           │  │
-│                                   │ → catalog_client.apply_tag()     │  │
 │                                   └──────────────────────────────────┘  │
+│                                                                         │
+│  apply_tags.py  (Flink scanner review step)                             │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  reads {topic}-scan-results  → latest batch                       │  │
+│  │  fetches schema from SR      → extracts existing tags             │  │
+│  │  presents new/changed tags   → [y/n/q] per field                  │  │
+│  │  patches schema (AVRO/JSON Schema/Protobuf)                       │  │
+│  │  registers new schema version in SR                               │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │  classifier-service (:8000)                                             │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  POST /classify                                                   │  │
-│  │                                                                   │  │
-│  │  Layer 1 ── field_name_recognizer.py                             │  │
-│  │             Consecutive token matching on field name              │  │
-│  │             Zero data access — instant, deterministic             │  │
-│  │                                                                   │  │
-│  │  Layer 2 ── Presidio AnalyzerEngine (regex only)                 │  │
-│  │             build_regex_analyzer() — no NLP engine               │  │
-│  │             Built-in + custom: PHI, PCI, FINANCIAL, CREDENTIALS  │  │
-│  │                                                                   │  │
-│  │  Layer 3 ── Presidio AnalyzerEngine (spaCy + GLiNER)             │  │
-│  │             build_ai_analyzer() — en_core_web_lg + GLiNER        │  │
-│  │             Handles free-text: comment, notes, description …     │  │
+│  │  POST /classify  [same as before]                                 │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -145,48 +145,81 @@ This means end-to-end latency for a small burst of messages is bounded by `consu
 
 ## Flink SQL scanner — detailed flow
 
+### Three triggers, one results topic
+
+All three trigger mechanisms write to `{topic}-scan-triggers`. The scan driver (Statement C) reacts to every trigger regardless of source.
+
 ```
-Operator opens Confluent Cloud Flink SQL workspace
-        │
-        ▼
-Statement A — sample + classify
-┌────────────────────────────────────────────────────────────────┐
-│ SELECT field_path, tag, MAX(score), MIN(layer), ANY_VALUE(...) │
-│ FROM `payments`,                                               │
-│      LATERAL TABLE(classify_fields(url, max_layer, $value))    │
-│ WHERE $rowtime >= CURRENT_TIMESTAMP - INTERVAL '2' MINUTES     │
-│ GROUP BY field_path, tag                                       │
-│ ORDER BY confidence DESC                                       │
-└────────────────────────────────────────────────────────────────┘
-        │
-        ▼  (results accumulate in Flink results pane)
+Trigger 1 — Scheduled (Statement A)
+  TUMBLE(source_topic, INTERVAL 'N' MINUTES)
+  → on each window close: INSERT INTO scan-triggers {trigger_type: 'scheduled'}
 
-  field_path          tag       confidence  layer  source
-  ──────────────────────────────────────────────────────
-  customer.email      PII       0.97        1      field_name
-  card.number         PCI       0.99        2      regex
-  notes               PII       0.74        3      ai_model
+Trigger 2 — Schema evolution (Statement B)
+  For each message in source_topic:
+    schema_watcher(sr_url, sr_key, sr_secret, subject)
+    ├─ rate-limited: checks SR at most once per minute
+    ├─ on first check: records current version, no emit
+    └─ on version increase: INSERT INTO scan-triggers {trigger_type: 'schema_evolution'}
 
-        │  (operator stops query after N minutes, reviews table)
-        ▼
-Statement B — approve + apply
-┌────────────────────────────────────────────────────────────────┐
-│ SELECT apply_tag(sr_url, key, secret, cluster_id,             │
-│                  subject, field_path, tag) AS result           │
-│ FROM (VALUES                                                   │
-│   ('payments-value', 'customer.email', 'PII'),                │
-│   ('payments-value', 'card.number',    'PCI')                  │
-│ ) AS approvals(subject, field_path, tag)                      │
-└────────────────────────────────────────────────────────────────┘
-        │
-        ▼  apply_tag() calls:
-           1. GET  {SR_URL}/subjects/{subject}/versions/latest  → version
-           2. POST {SR_URL}/catalog/v1/entity/tags              → tag applied
+Trigger 3 — Manual (start_scan.sh --now)
+  One-shot Flink statement:
+    INSERT INTO scan-triggers VALUES ('manual', topic, CURRENT_TIMESTAMP)
 
-        Result column shows: "OK: PII → payments-value.customer.email"
+Statement C — Scan driver (always running)
+  scan-triggers AS t
+  JOIN source_topic AS p
+    ON p.$rowtime BETWEEN t.triggered_at - INTERVAL 'M' MINUTES AND t.triggered_at
+  → classify_fields(url, max_layer, $value) UDTF
+  → INSERT INTO scan-results (field_path, tag, confidence, layer, source, example, trigger_type, scanned_at)
 ```
 
-The two UDFs (`ClassifyFieldsUDF`, `ApplyTagUDF`) are packaged as a single fat JAR and registered once per Flink environment.
+### apply_tags.py — human review and schema patching
+
+```
+apply_tags.py
+  │
+  ├─ 1. Read {topic}-scan-results → latest scanned_at batch, deduplicated
+  │
+  ├─ 2. Fetch schema from SR → detect schema type (AVRO / JSON Schema / Protobuf)
+  │       Extract existing (field_path, tag) pairs already in schema
+  │
+  ├─ 3. Filter
+  │       Already in schema → silently skipped
+  │       New or changed   → shown for approval
+  │
+  ├─ 4. Interactive prompt (new tags only)
+  │       [1/N] Field: customer.email  Tag: PII  Confidence: HIGH (0.97)
+  │       Approve? [y/n/q]
+  │
+  └─ 5. One schema update
+          Fetch schema once
+          Patch all approved fields:
+            AVRO:        "confluent:tags": ["PII"]  on field object
+            JSON Schema: "confluent:tags": ["PII"]  on property
+            Protobuf:    [(confluent.field_meta) = {tags: ["PII"]}]  on field
+          Register new version → SR v{N+1}
+```
+
+### SchemaWatcherUDF — how it works
+
+`SchemaWatcherUDF` is a Flink UDTF that acts as an event source for schema changes:
+
+- Called once per incoming message on the source topic (the topic acts as a heartbeat)
+- Internally rate-limited: only calls `GET /subjects/{subject}/versions/latest` at most once per minute regardless of message volume
+- Maintains `lastKnownVersion` as a transient instance variable (persists for the job lifetime; resets on restart)
+- On first successful check: records version, does **not** emit (no baseline to compare)
+- On version increase: emits one row `(triggered_at)` → written to scan-triggers topic
+
+### Configuration
+
+Both scheduling parameters live in `flink-scanner/scan.env`:
+
+```
+SCAN_INTERVAL_MINUTES=60    # TUMBLE window size — how often Statement A fires
+SAMPLE_WINDOW_MINUTES=2     # interval join lookback — how much data Statement C classifies
+```
+
+These are independent. Change either in `scan.env` and restart with `start_scan.sh`.
 
 ---
 
@@ -260,18 +293,35 @@ Layer 1 uses **consecutive token subsequence matching**:
 
 ---
 
-## Stream Catalog — tag application
+## Schema Registry — tag application
 
-Tags are applied to Schema Registry field entities. The Confluent Stream Catalog qualified name format is:
+Tags are embedded directly in the schema definition, not as Stream Catalog metadata. This makes tags portable — any consumer or governance tool that reads the schema sees them.
 
+**AVRO** — `confluent:tags` field property:
+```json
+{
+  "name": "email",
+  "type": "string",
+  "confluent:tags": ["PII"]
+}
 ```
-{sr_cluster_id}:.:{subject}.v{version}.{field_path}
 
-Example:
-lsrc-abc123:.:.payments-value.v3.customer.email
+**JSON Schema** — `confluent:tags` vendor extension on property:
+```json
+{
+  "properties": {
+    "email": { "type": "string", "confluent:tags": ["PII"] }
+  }
+}
 ```
 
-Tag definitions are bootstrapped once on first run (idempotent `POST /catalog/v1/types/tagdefs`). Tag application is idempotent — HTTP 409 (already tagged) is treated as success.
+**Protobuf** — `confluent.field_meta` option:
+```proto
+import "confluent/meta.proto";
+string email = 1 [(confluent.field_meta) = {tags: ["PII"]}];
+```
+
+`apply_tags.py` detects the schema type automatically, patches all approved fields in one pass, and registers a single new version. Tags already present in the schema are never re-prompted.
 
 ---
 

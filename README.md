@@ -1,7 +1,7 @@
 # Auto Data Classifier
 
 Domain-agnostic, real-time data classification for Confluent Cloud.
-Inspects Kafka messages in-flight, identifies sensitive data across 11 standard tags, and surfaces field-level labels directly in the Confluent Stream Catalog — without sending data outside your infrastructure.
+Inspects Kafka messages in-flight, identifies sensitive data across 11 standard tags, and applies field-level tags directly to Schema Registry schema definitions — without sending data outside your infrastructure.
 
 ## Who is this for?
 
@@ -49,22 +49,35 @@ review-api  (field-level human review)  ─────────────�
   └─ POST /recommendations/bulk-approve  (approve all score ≥ 0.85)
 ```
 
-### Mode 2 — Interactive Flink SQL Scanner (on-demand)
+### Mode 2 — Flink SQL Scanner (scheduled + event-driven)
 
-Run a one-shot Flink SQL query to profile a topic for N minutes, review the field-level recommendations in the results pane, then approve and apply tags — all from the Confluent Cloud Flink workspace.
+Three long-running Flink statements profile topics automatically and write classification results to a results topic. Tags are applied to the Schema Registry schema itself — not the Stream Catalog.
 
 ```
-Flink SQL workspace
+Confluent Cloud Flink (3 continuous statements)
   │
-  ├─ Statement A — classify_fields() UDTF
-  │     Reads topic for N minutes, classifies each message,
-  │     shows (field_path, tag, confidence, layer, source, example)
+  ├─ Statement A — Scheduled trigger
+  │     TUMBLE window fires every SCAN_INTERVAL_MINUTES
+  │     → writes trigger to {topic}-scan-triggers
   │
-  ├─ User reviews results table
+  ├─ Statement B — Schema-evolution trigger
+  │     schema_watcher() UDF polls SR for new schema versions
+  │     → writes trigger to {topic}-scan-triggers on version change
   │
-  └─ Statement B — apply_tag() scalar UDF
-        Applies approved tags to Confluent Stream Catalog
+  └─ Statement C — Scan driver
+        interval-joins trigger topic with source topic
+        classify_fields() UDTF on last SAMPLE_WINDOW_MINUTES of data
+        → writes (field_path, tag, confidence, layer, source) to {topic}-scan-results
+
+apply_tags.py (run by operator when ready)
+  ├─ reads latest batch from {topic}-scan-results
+  ├─ skips fields already tagged in the schema (no re-prompt)
+  ├─ presents new/changed tags interactively [y/n/q]
+  └─ fetches schema → patches all approved fields → registers one new version
 ```
+
+Manual trigger: start_scan.sh --now inserts a row into the trigger topic;
+Statement C reacts within seconds.
 
 All model inference is **100% local** — no data leaves your environment at runtime.
 
@@ -152,14 +165,18 @@ auto-data-classifier/
 │   ├── config.py                All environment variable config
 │   └── catalog_tagger.py        Stream Catalog tagger + tag definitions
 │
-├── flink-scanner/               Confluent Cloud Flink SQL UDFs
+├── flink-scanner/               Confluent Cloud Flink SQL UDFs + scanner
 │   ├── pom.xml                  Maven build (Java 11, Flink 1.19)
+│   ├── scan.env                 All configuration (schedule, credentials)
+│   ├── apply_tags.py            Interactive review + schema patching (Python)
 │   ├── src/.../ClassifyFieldsUDF.java   UDTF — calls /classify per message
-│   ├── src/.../ApplyTagUDF.java         Scalar — applies tag to Stream Catalog
-│   ├── sql/scan.sql             Interactive scan template (2 statements)
+│   ├── src/.../SchemaWatcherUDF.java    UDTF — polls SR, emits on schema change
+│   ├── src/.../ApplyTagUDF.java         Scalar — catalog-level tagging (routing.sql)
+│   ├── sql/scan.sql             Three-trigger Flink SQL (statements A, B, C)
 │   └── scripts/
 │       ├── build.sh             mvn package → fat JAR
-│       └── register.sh          Upload JAR, CREATE FUNCTION in Flink
+│       ├── register.sh          Upload JAR, CREATE FUNCTION (3 UDFs)
+│       └── start_scan.sh        start | --now | --stop | --status
 │
 ├── e2e/                         End-to-end test tooling
 │   ├── start_classifier.sh      Start classifier natively (no Docker needed)
@@ -210,16 +227,29 @@ docker-compose up
 ### Run the Flink SQL scanner
 
 ```bash
-# 1. Build the UDF JAR
+# 1. Fill in scan.env (classifier URL, SR creds, Kafka creds, topic, schedule)
+vim flink-scanner/scan.env
+
+# 2. Build the UDF JAR
 bash flink-scanner/scripts/build.sh
 
-# 2. Register UDFs in Confluent Cloud
+# 3. Register UDFs in Confluent Cloud (once per environment)
 export CONFLUENT_ENVIRONMENT=env-xxxxx
 export CONFLUENT_COMPUTE_POOL=lfcp-xxxxx
 bash flink-scanner/scripts/register.sh
 
-# 3. Open Confluent Cloud → Flink SQL workspace
-#    Paste flink-scanner/sql/scan.sql, set your classifier URL and topic, run.
+# 4. Start all three Flink statements (runs continuously)
+bash flink-scanner/scripts/start_scan.sh
+
+# 5. Trigger a manual scan at any time
+bash flink-scanner/scripts/start_scan.sh --now
+
+# 6. Review and apply tags when ready
+source flink-scanner/scan.env
+python flink-scanner/apply_tags.py \
+  --topic     $SOURCE_TOPIC \
+  --sr-url    $SR_URL --sr-key $SR_KEY --sr-secret $SR_SECRET \
+  --bootstrap $KAFKA_BOOTSTRAP --kafka-key $KAFKA_KEY --kafka-secret $KAFKA_SECRET
 ```
 
 ### End-to-end test
@@ -258,6 +288,10 @@ All configuration is via environment variables. See `.env.example` for the full 
 | `BATCH_SIZE` | `50` | Messages per commit batch |
 | `MAX_CONCURRENT` | `10` | Concurrent classification requests (use `3` on Mac with Layer 3) |
 | `CLASSIFIER_TIMEOUT_S` | `5.0` | Per-request timeout in seconds (use `15.0` on Mac with Layer 3) |
+| `SCAN_INTERVAL_MINUTES` | `60` | Flink scanner: how often to scan (minutes between scans) |
+| `SAMPLE_WINDOW_MINUTES` | `2` | Flink scanner: how many minutes of data to sample per scan |
+
+Note: `SCAN_INTERVAL_MINUTES` and `SAMPLE_WINDOW_MINUTES` are set in `flink-scanner/scan.env`, not in `.env`.
 
 ---
 

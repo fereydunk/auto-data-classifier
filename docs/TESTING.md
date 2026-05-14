@@ -188,21 +188,49 @@ Produces 200 JSON messages covering all 11 tag types including nested structures
 
 ### Step 5 — Run the Flink SQL scanner
 
-1. Build and register the UDFs:
 ```bash
+# 1. Build the UDF JAR
 bash flink-scanner/scripts/build.sh
 
+# 2. Register all three UDFs in Confluent Cloud (once per environment)
 export CONFLUENT_ENVIRONMENT=env-xxxxx
 export CONFLUENT_COMPUTE_POOL=lfcp-xxxxx
 bash flink-scanner/scripts/register.sh
-```
+# Registers: classify_fields(), schema_watcher(), apply_tag()
 
-2. Open Confluent Cloud → Flink SQL workspace
-3. Paste `flink-scanner/sql/scan.sql`
-4. Update the configuration block (classifier URL, SR credentials, topic name)
-5. Run Statement A — wait 2 minutes, stop, review the results table
-6. Edit Statement B with the fields you approve, run it
-7. Verify tags in the Stream Catalog
+# 3. Fill in flink-scanner/scan.env with your credentials and schedule
+vim flink-scanner/scan.env
+#   SCAN_INTERVAL_MINUTES=60   ← how often Flink scans
+#   SAMPLE_WINDOW_MINUTES=2    ← how much data per scan
+#   SOURCE_TOPIC, CLASSIFIER_URL, SR_URL/KEY/SECRET, KAFKA_BOOTSTRAP/KEY/SECRET
+
+# 4. Start all three Flink statements (run once — they run continuously)
+bash flink-scanner/scripts/start_scan.sh
+# Starts:
+#   {topic}-scan-trigger-scheduled  — TUMBLE window, fires every N min
+#   {topic}-scan-trigger-schema     — SchemaWatcherUDF, reacts to SR version changes
+#   {topic}-scan-driver             — interval join, classifies last M min on each trigger
+
+# 5. Fire a manual scan at any time
+bash flink-scanner/scripts/start_scan.sh --now
+
+# 6. When ready to review — run apply_tags.py
+source flink-scanner/scan.env
+python flink-scanner/apply_tags.py \
+  --topic     $SOURCE_TOPIC \
+  --sr-url    $SR_URL --sr-key $SR_KEY --sr-secret $SR_SECRET \
+  --bootstrap $KAFKA_BOOTSTRAP --kafka-key $KAFKA_KEY --kafka-secret $KAFKA_SECRET
+# → reads latest batch from {topic}-scan-results topic
+# → skips fields already tagged in schema
+# → prompts [y/n/q] for new/changed tags
+# → patches schema (AVRO / JSON Schema / Protobuf) → registers one new version
+
+# Check statement status
+bash flink-scanner/scripts/start_scan.sh --status
+
+# Stop all scanner statements
+bash flink-scanner/scripts/start_scan.sh --stop
+```
 
 ---
 

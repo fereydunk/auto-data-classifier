@@ -1,145 +1,144 @@
 -- ============================================================
--- Flink SQL Data Scanner  —  Interactive Topic Profiler
+-- Flink SQL Data Scanner  —  Three-Trigger Architecture
 -- ============================================================
 --
--- WORKFLOW
---   1. Edit the ── Configuration ── block below.
---   2. Run STATEMENT A.  Flink accumulates results for N minutes.
---   3. Stop the query manually once the results look representative.
---   4. Review the output table.
---   5. Edit the VALUES block in STATEMENT B with the tags you approve.
---   6. Run STATEMENT B.  Tags are written to the Stream Catalog.
+-- Four statements, submitted once via start_scan.sh.
+-- All run continuously in Confluent Cloud Flink.
 --
--- The only thing that changes between topics is the configuration
--- block and the VALUES list in Statement B.
+-- Trigger 1 — Scheduled:        TUMBLE window emits a trigger every N minutes.
+-- Trigger 2 — Schema evolution:  schema_watcher() UDF detects new SR version.
+-- Trigger 3 — Manual:           one-shot INSERT into the trigger topic.
+--
+-- All three write to {topic}-scan-triggers.
+-- One unified scan driver reads every trigger, classifies the last M minutes
+-- of source data, and writes results to {topic}-scan-results.
+--
+-- Placeholders replaced by start_scan.sh at submit time:
+--   {source_topic}           e.g. payments
+--   {scan_interval_minutes}  e.g. 60
+--   {sample_window_minutes}  e.g. 2
+--   {classifier_url}         e.g. https://classifier.example.com
+--   {max_layer}              e.g. 3
+--   {sr_url}                 e.g. https://psrc-xxx.confluent.cloud
+--   {sr_key}                 e.g. SR API key
+--   {sr_secret}              e.g. SR API secret
 -- ============================================================
 
 
--- ── Configuration ────────────────────────────────────────────────────────────
--- Edit these before running. Keep the quotes.
+-- ── Step 1: create supporting tables (run once) ───────────────────────────────
 
--- Classifier service (needs a public HTTPS endpoint, not localhost)
--- For local dev: expose with  ngrok http 8000  and use the ngrok URL.
-SET 'classifier.url'   = 'https://your-classifier.example.com';
-SET 'classifier.layer' = '3';         -- 1 = field name only | 2 = +regex | 3 = +AI
+-- Trigger topic — receives events from all three trigger sources.
+-- The scan driver reacts to every row written here.
+CREATE TABLE IF NOT EXISTS `{source_topic}-scan-triggers` (
+    `trigger_type`  STRING,                   -- 'scheduled' | 'schema_evolution' | 'manual'
+    `source_topic`  STRING,
+    `triggered_at`  TIMESTAMP(3),
+    WATERMARK FOR `triggered_at` AS `triggered_at` - INTERVAL '10' SECONDS
+);
 
--- Your Confluent Schema Registry / Stream Catalog credentials
-SET 'sr.url'           = 'https://psrc-xxxxx.us-east-1.aws.confluent.cloud';
-SET 'sr.api.key'       = 'YOUR_SR_API_KEY';
-SET 'sr.api.secret'    = 'YOUR_SR_API_SECRET';
-SET 'sr.cluster.id'    = 'lsrc-xxxxx';
+-- Results topic — receives classification output from the scan driver.
+-- apply_tags.py reads the latest batch from here.
+CREATE TABLE IF NOT EXISTS `{source_topic}-scan-results` (
+    `field_path`    STRING,
+    `tag`           STRING,
+    `confidence`    DOUBLE,
+    `layer`         INT,
+    `source`        STRING,
+    `example`       STRING,
+    `source_topic`  STRING,
+    `trigger_type`  STRING,
+    `scanned_at`    TIMESTAMP(3)
+) WITH (
+    'kafka.retention.ms' = '604800000'   -- 7 days
+);
 
--- Topic to profile — must be visible in the current Flink catalog
-SET 'source.topic'     = 'payments';
 
--- How many minutes of data to sample.
--- Flink reads from the topic right now; stop the query after N minutes.
-SET 'sample.minutes'   = '2';
+-- ── Statement A: Scheduled trigger ───────────────────────────────────────────
+-- Emits one trigger row at the close of every TUMBLE window.
+-- The window size IS the scan interval.
 
--- ── STATEMENT A: Sample + Classify ───────────────────────────────────────────
--- Run this statement.  Results appear in the panel as messages arrive.
--- After ~N minutes (or once you see enough unique fields), stop the query.
---
--- Output columns:
---   field_path   dot-notation path to the field, e.g. "customer.email"
---   tag          detected data tag: PII | PHI | PCI | CREDENTIALS | FINANCIAL |
---                  GOVERNMENT_ID | BIOMETRIC | GENETIC | NPI | LOCATION | MINOR
---   confidence   highest score across all detections for this field+tag pair
---   layer        which layer first found it: 1=field name, 2=regex, 3=AI
---   source       "field_name" | "regex" | "ai_model"
---   example      a short snippet from the field value (truncated to 50 chars)
-
+INSERT INTO `{source_topic}-scan-triggers`
 SELECT
-    field_path,
-    tag,
-    ROUND(MAX(score), 2)    AS confidence,
-    MIN(layer)              AS layer,
-    ANY_VALUE(source)       AS source,
-    ANY_VALUE(sample_value) AS example
+    'scheduled'                 AS trigger_type,
+    '{source_topic}'            AS source_topic,
+    MAX(window_end)             AS triggered_at
+FROM TABLE(
+    TUMBLE(
+        TABLE `{source_topic}`,
+        DESCRIPTOR(`$rowtime`),
+        INTERVAL '{scan_interval_minutes}' MINUTES
+    )
+)
+GROUP BY window_start, window_end;
+
+
+-- ── Statement B: Schema-evolution trigger ─────────────────────────────────────
+-- schema_watcher() is called for each incoming message on the source topic.
+-- The UDF rate-limits SR checks to once per minute and only emits a row
+-- when the schema version has increased since the last check.
+
+INSERT INTO `{source_topic}-scan-triggers`
+SELECT
+    'schema_evolution'          AS trigger_type,
+    '{source_topic}'            AS source_topic,
+    triggered_at
 FROM
-    `payments`,                                 -- ← replace with ${source.topic}
+    `{source_topic}`,
+    LATERAL TABLE(
+        schema_watcher(
+            '{sr_url}',
+            '{sr_key}',
+            '{sr_secret}',
+            '{source_topic}-value'
+        )
+    );
+
+
+-- ── Statement C: Unified scan driver ─────────────────────────────────────────
+-- Reacts to every trigger in the trigger topic.
+-- For each trigger, interval-joins with the source topic to fetch messages
+-- from the last SAMPLE_WINDOW_MINUTES, classifies them, and writes results.
+--
+-- The interval join condition:
+--   p.$rowtime BETWEEN t.triggered_at - INTERVAL 'M' MINUTES AND t.triggered_at
+-- pulls only the messages that arrived in the sample window before the trigger.
+
+INSERT INTO `{source_topic}-scan-results`
+SELECT
+    c.field_path,
+    c.tag,
+    ROUND(MAX(c.score), 2)      AS confidence,
+    MIN(c.layer)                AS layer,
+    ANY_VALUE(c.source)         AS source,
+    ANY_VALUE(c.sample_value)   AS example,
+    t.source_topic,
+    t.trigger_type,
+    t.triggered_at              AS scanned_at
+FROM
+    `{source_topic}-scan-triggers` AS t
+JOIN
+    `{source_topic}` AS p
+    ON p.`$rowtime` BETWEEN t.triggered_at - INTERVAL '{sample_window_minutes}' MINUTES
+                        AND t.triggered_at,
     LATERAL TABLE(
         classify_fields(
-            'https://your-classifier.example.com',  -- ← ${classifier.url}
-            3,                                       -- ← ${classifier.layer}
-            CAST(`$value` AS STRING)                 -- raw JSON message value
+            '{classifier_url}',
+            {max_layer},
+            CAST(p.`$value` AS STRING)
         )
-    )
--- Time-bound the sample to the last N minutes.
--- On first run you may want to remove this line to see all available data.
-WHERE `$rowtime` >= CURRENT_TIMESTAMP - INTERVAL '2' MINUTES  -- ← ${sample.minutes}
+    ) AS c
 GROUP BY
-    field_path,
-    tag
-ORDER BY
-    confidence DESC;
+    c.field_path,
+    c.tag,
+    t.trigger_type,
+    t.triggered_at,
+    t.source_topic;
 
--- ── Reading the results ───────────────────────────────────────────────────────
---
---   field_path          tag          confidence  layer  source      example
---   ─────────────────────────────────────────────────────────────────────────
---   customer.email      PII          0.97        1      field_name  alice@ex…
---   card.number         PCI          0.99        2      regex       4111111…
---   customer.dob        PII          0.91        1      field_name  (empty)
---   routing_number      FINANCIAL    0.88        2      regex       02100002…
---   notes               PII          0.74        3      ai_model    She repo…
---   ref_code            (no match)
---
--- HIGH confidence (≥ 0.85): safe to bulk-approve
--- MEDIUM (0.60–0.84):       review individually
--- LOW (< 0.60):             inspect the example snippet before approving
---
--- ── STATEMENT B: Approve + Apply ─────────────────────────────────────────────
--- After reviewing the output above, fill in the VALUES block with the
--- (subject, field_path, tag) triples you want to approve.
--- Then run this statement — each row shows "OK: ..." or "ERROR: ..." live.
 
-SELECT
-    apply_tag(
-        'https://psrc-xxxxx.us-east-1.aws.confluent.cloud',  -- ← ${sr.url}
-        'YOUR_SR_API_KEY',                                    -- ← ${sr.api.key}
-        'YOUR_SR_API_SECRET',                                 -- ← ${sr.api.secret}
-        'lsrc-xxxxx',                                         -- ← ${sr.cluster.id}
-        subject,
-        field_path,
-        tag
-    ) AS result
-FROM (VALUES
-    --  subject               field_path            tag
-    ('payments-value',  'customer.email',    'PII'),
-    ('payments-value',  'card.number',       'PCI'),
-    ('payments-value',  'customer.dob',      'PII'),
-    ('payments-value',  'routing_number',    'FINANCIAL')
-    -- add / remove rows here
-) AS approvals(subject, field_path, tag);
+-- ── Statement D: Manual trigger (one-shot) ────────────────────────────────────
+-- Submitted by start_scan.sh --now.
+-- Inserts a single row into the trigger topic; the scan driver reacts immediately.
+-- This statement is NOT part of the long-running job — it is submitted separately.
 
--- ── Bulk-approve shortcut ─────────────────────────────────────────────────────
--- If you trust all HIGH-confidence results (score ≥ 0.85), skip editing the
--- VALUES block and run this instead.  It re-classifies the same window and
--- immediately applies every tag with confidence ≥ 0.85.
---
--- USE WITH CARE — review Statement A results first.
-
--- SELECT
---     apply_tag(
---         'https://psrc-xxxxx.us-east-1.aws.confluent.cloud',
---         'YOUR_SR_API_KEY',
---         'YOUR_SR_API_SECRET',
---         'lsrc-xxxxx',
---         CONCAT('payments', '-value'),
---         field_path,
---         tag
---     ) AS result
--- FROM
---     `payments`,
---     LATERAL TABLE(
---         classify_fields(
---             'https://your-classifier.example.com',
---             3,
---             CAST(`$value` AS STRING)
---         )
---     )
--- WHERE `$rowtime` >= CURRENT_TIMESTAMP - INTERVAL '2' MINUTES
---   AND score >= 0.85
--- GROUP BY field_path, tag
--- HAVING MAX(score) >= 0.85;
+-- INSERT INTO `{source_topic}-scan-triggers`
+-- VALUES ('manual', '{source_topic}', CURRENT_TIMESTAMP);
