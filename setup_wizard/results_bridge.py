@@ -35,6 +35,13 @@ ENV_FILE  = REPO_ROOT / ".env"
 # their schema_id in bytes 1..4; we fetch from SR once per id and reuse.
 _SCHEMA_CACHE: dict[int, object] = {}
 
+# Cache: subject → (schema_id, expiry_unix_ts). 60-s TTL so a mid-run schema
+# bump (e.g. user re-runs Card 5 with a tweaked schema) is picked up within
+# ~1 minute. Keyed by subject because the bridge can in principle handle
+# multiple topics; in practice it's pinned to one --topic per process.
+_SOURCE_SCHEMA_ID_CACHE: dict[str, tuple[int, float]] = {}
+_SOURCE_SCHEMA_ID_TTL_S = 60
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 log = logging.getLogger("results-bridge")
 
@@ -76,6 +83,41 @@ def _post_recommendation(review_url: str, rec: dict) -> bool:
     except Exception as exc:    # noqa: BLE001 — connection refused / DNS / timeout
         log.warning("review-api unreachable: %s", exc)
         return False
+
+
+def _fetch_source_schema_id(subject: str, sr_url: str, sr_key: str, sr_secret: str) -> int | None:
+    """Return the LATEST schema_id for `subject` from SR, with 60-s TTL cache.
+
+    Used to stamp every recommendation with the schema_id of the source
+    topic's currently-registered schema, so review-api's _resolve_version /
+    validate-staged can pin the rec to a specific schema version instead
+    of always falling back to "latest". Returns None on any SR error —
+    caller falls back to omitting schema_id (preserves prior behavior).
+
+    The TTL means a Card 5 re-run that registers a new schema_id is
+    picked up within ~60s without restarting the bridge process.
+    """
+    cached = _SOURCE_SCHEMA_ID_CACHE.get(subject)
+    now = time.time()
+    if cached and cached[1] > now:
+        return cached[0]
+    base = sr_url.rstrip("/")
+    auth = base64.b64encode(f"{sr_key}:{sr_secret}".encode()).decode()
+    try:
+        req = urllib.request.Request(
+            f"{base}/subjects/{subject}/versions/latest",
+            headers={"Authorization": f"Basic {auth}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            sid = json.loads(r.read()).get("id")
+        if isinstance(sid, int):
+            _SOURCE_SCHEMA_ID_CACHE[subject] = (sid, now + _SOURCE_SCHEMA_ID_TTL_S)
+            return sid
+    except urllib.error.HTTPError as exc:
+        log.warning("SR latest fetch for %s failed: HTTP %d", subject, exc.code)
+    except Exception as exc:    # noqa: BLE001
+        log.warning("SR latest fetch for %s failed: %s", subject, exc)
+    return None
 
 
 def _decode_wire_avro(raw: bytes, sr_url: str, sr_key: str, sr_secret: str) -> dict | None:
@@ -184,10 +226,14 @@ def run_bridge(*, topic: str, bootstrap: str, kafka_key: str, kafka_secret: str,
         if row.get("source_topic") != topic:
             continue
 
+        # Stamp every rec with the source topic's CURRENT SR schema_id so
+        # review-api's _resolve_version / validate-staged can pin the rec
+        # to a specific schema version (instead of always assuming "latest").
+        # 60-s TTL inside _fetch_source_schema_id keeps SR load bounded.
         rec = {
             "topic":         row.get("source_topic", topic),
             "subject":       subject,
-            "schema_id":     None,    # review-api falls back to latest version
+            "schema_id":     _fetch_source_schema_id(subject, sr_url, sr_key, sr_secret),
             "field_path":    row["field_path"],
             "proposed_tag":  row["tag"],
             # Flink scan-results doesn't carry entity_type separately —
