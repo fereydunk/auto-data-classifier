@@ -91,6 +91,24 @@ async def classify_message(
         return None
 
 
+async def post_recommendations_batch(
+    client: httpx.AsyncClient,
+    topic: str,
+    detected_entities: Dict[str, Any],
+    schema_id: Optional[int],
+) -> bool:
+    """Wrap post_recommendations with a success/fail bool so the caller can
+    decide whether to commit the source offset. Failure here means the user
+    will not see a recommendation in the review UI for this message — we MUST
+    NOT commit, because re-processing on next poll is the only retry path."""
+    try:
+        await post_recommendations(client, topic, detected_entities, schema_id)
+        return True
+    except Exception as e:    # noqa: BLE001
+        logger.warning("post_recommendations failed: %s", e)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Message routing
 # ---------------------------------------------------------------------------
@@ -209,15 +227,42 @@ async def run():
     )
 
     shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
-    def _sigterm(*_):
+    def _on_shutdown_signal():
         logger.info("Shutdown signal received")
         shutdown.set()
 
-    signal.signal(signal.SIGTERM, _sigterm)
-    signal.signal(signal.SIGINT, _sigterm)
+    # Use add_signal_handler instead of signal.signal — signal handlers run on
+    # the main thread but asyncio.Event.set() is not thread-safe to call from
+    # outside the loop. add_signal_handler schedules it on the loop properly.
+    loop.add_signal_handler(signal.SIGTERM, _on_shutdown_signal)
+    loop.add_signal_handler(signal.SIGINT, _on_shutdown_signal)
 
     semaphore = asyncio.Semaphore(cfg.MAX_CONCURRENT_CLASSIFICATIONS)
+
+    async def _flush_batch(pending_tasks: list[asyncio.Task]) -> None:
+        """Await the batch and commit only if every task succeeded.
+
+        Each task returns True/False. If ANY task failed (classifier 5xx,
+        review-api down, route_message produce error), do NOT commit — the
+        next poll will re-deliver these messages. Yes, that means the
+        successful ones in the batch will also be re-processed; the review-api
+        upsert and the producer's idempotence flag (config.py) make this safe.
+        Far better than dropping a message because /classify timed out once.
+        """
+        results = await asyncio.gather(*pending_tasks, return_exceptions=True)
+        all_ok = all(r is True for r in results)
+        producer.flush()
+        if all_ok:
+            consumer.commit(asynchronous=False)
+        else:
+            failed = sum(1 for r in results if r is not True)
+            logger.warning(
+                "Batch had %d failed message(s) of %d — NOT committing offsets; "
+                "will re-process on next poll", failed, len(results),
+            )
+        pending_tasks.clear()
 
     async with httpx.AsyncClient() as http_client:
         pending: list[asyncio.Task] = []
@@ -226,12 +271,8 @@ async def run():
             msg = consumer.poll(timeout=1.0)
 
             if msg is None:
-                # Flush partial batch when idle — avoids stalling on < BATCH_SIZE messages
                 if pending:
-                    await asyncio.gather(*pending)
-                    pending.clear()
-                    producer.flush()
-                    consumer.commit(asynchronous=False)
+                    await _flush_batch(pending)
                 continue
             if msg.error():
                 if msg.error().code() == KafkaError._PARTITION_EOF:
@@ -240,6 +281,9 @@ async def run():
 
             raw_value = msg.value()
             if not raw_value:
+                # Empty value: nothing to classify, but DO commit — it's a
+                # tombstone or producer error, not a transient downstream
+                # failure. Re-processing it would just re-skip it forever.
                 consumer.commit(asynchronous=False)
                 continue
 
@@ -250,35 +294,31 @@ async def run():
                 consumer.commit(asynchronous=False)
                 continue
 
-            async def process(p=payload, k=msg.key(), sid=schema_id):
+            async def process(p=payload, k=msg.key(), sid=schema_id) -> bool:
                 async with semaphore:
                     result = await classify_message(http_client, p)
-                    if result:
+                    if not result:
+                        return False
+                    try:
                         route_message(producer, p, result, k)
+                    except Exception as e:    # noqa: BLE001
+                        logger.warning("route_message failed: %s", e)
+                        return False
+                    detected = result.get("detected_entities", {})
+                    if detected:
+                        return await post_recommendations_batch(
+                            http_client, cfg.SOURCE_TOPIC, detected, sid
+                        )
+                    return True
 
-                        # Post recommendations to the review API (non-blocking best-effort)
-                        detected = result.get("detected_entities", {})
-                        if detected:
-                            await post_recommendations(
-                                http_client, cfg.SOURCE_TOPIC, detected, sid
-                            )
-                    else:
-                        logger.warning("Classification failed — message skipped")
-
-            task = asyncio.create_task(process())
-            pending.append(task)
+            pending.append(asyncio.create_task(process()))
 
             if len(pending) >= cfg.BATCH_SIZE:
-                await asyncio.gather(*pending)
-                pending.clear()
-                producer.flush()
-                consumer.commit(asynchronous=False)
+                await _flush_batch(pending)
 
-        # Drain remaining
         if pending:
-            await asyncio.gather(*pending)
+            await _flush_batch(pending)
         producer.flush()
-        consumer.commit(asynchronous=False)
         consumer.close()
         logger.info("Pipeline shut down cleanly.")
 

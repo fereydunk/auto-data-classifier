@@ -28,6 +28,14 @@ import java.util.Base64;
  * row is written to the scan-triggers topic by the schema-evolution statement,
  * which causes the unified scan driver to immediately classify recent messages.
  *
+ * MUST run with parallelism = 1. lastKnownVersion is per-task-instance state
+ * (transient field, not Flink-managed ListState/ValueState). With parallelism
+ * &gt; 1, every parallel subtask runs its own SR poll and its own version
+ * baseline — a single schema bump emits N duplicate triggers, and rescaling
+ * resets the baseline which can re-emit on the next check. start_scan.sh's
+ * Statement B uses default Flink parallelism for this reason; verify your
+ * compute pool's autoscaler doesn't override it.
+ *
  * SQL usage (schema-evolution trigger producer):
  *   INSERT INTO `{topic}-scan-triggers`
  *   SELECT 'schema_evolution' AS trigger_type,

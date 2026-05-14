@@ -30,6 +30,24 @@ def _load_review_api():
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _clear_sr_cache():
+    """sr_schema's module-level cache leaks across tests in the same process —
+    a (subject, version) entry from one test would satisfy a later test's
+    fetch and mask SR-validation logic. Clear before AND after every test."""
+    try:
+        from sr_schema import _clear_cache_for_tests
+        _clear_cache_for_tests()
+    except ImportError:
+        pass
+    yield
+    try:
+        from sr_schema import _clear_cache_for_tests
+        _clear_cache_for_tests()
+    except ImportError:
+        pass
+
+
 @pytest.fixture()
 def client(tmp_path):
     """Each test gets its own SQLite file so connections share the same DB."""
@@ -458,9 +476,11 @@ class TestValidateStaged:
             return 1
         async def fake_paths(*_a, **_kw):
             return {"real.field"}
-        with patch("main._resolve_version", new=AsyncMock(side_effect=fake_resolve)) if False else \
-             patch("catalog_client._resolve_version", new=AsyncMock(side_effect=fake_resolve)), \
-             patch("main.fetch_field_paths_cached", new=AsyncMock(side_effect=fake_paths)):
+        async def fake_meta(*_a, **_kw):
+            return (42, "io.example.Record")
+        with patch("main._resolve_version", new=AsyncMock(side_effect=fake_resolve)), \
+             patch("main.fetch_field_paths_cached", new=AsyncMock(side_effect=fake_paths)), \
+             patch("main.fetch_schema_meta_cached", new=AsyncMock(side_effect=fake_meta)):
             resp = client.get("/recommendations/validate-staged")
         assert resp.status_code == 200
         data = resp.json()

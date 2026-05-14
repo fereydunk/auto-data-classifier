@@ -68,4 +68,8 @@ class Config:
             "acks": "all",
             "retries": 5,
             "retry.backoff.ms": 300,
+            # acks=all + retries without idempotence allows duplicate produces
+            # on retry; with idempotence the broker dedups by producer-id +
+            # sequence number. acks=all is already required for idempotence.
+            "enable.idempotence": True,
         }

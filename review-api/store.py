@@ -146,13 +146,21 @@ class RecommendationStore:
                 row = await cur.fetchone()
                 return _row_to_rec(row) if row else None
 
-    async def bulk_approve(
+    async def bulk_stage(
         self,
         min_confidence: float,
         topic: Optional[str] = None,
         tag: Optional[str] = None,
     ) -> List[Recommendation]:
-        """Mark all PENDING recommendations above min_confidence as APPROVED."""
+        """Move every PENDING recommendation above min_confidence to STAGED.
+
+        The /recommendations/bulk-approve endpoint then calls _submit_staged_impl
+        to actually push them to Stream Catalog. Going PENDING→STAGED here (not
+        PENDING→APPROVED) means a crash between this call and submit-staged
+        leaves the rows in STAGED — recoverable, replayable. The earlier
+        implementation flipped to APPROVED then back to STAGED, which left rows
+        falsely marked APPROVED if the process died mid-flight.
+        """
         now = datetime.now(timezone.utc).isoformat()
         conditions = ["status='PENDING'", "confidence>=?"]
         params: list = [min_confidence]
@@ -167,26 +175,24 @@ class RecommendationStore:
         where = " AND ".join(conditions)
 
         async with aiosqlite.connect(self._db_path) as db:
-            # Fetch the matching IDs first
             async with db.execute(
                 f"SELECT id FROM recommendations WHERE {where}", params
             ) as cur:
                 ids = [row[0] for row in await cur.fetchall()]
 
-            if ids:
-                placeholders = ",".join("?" * len(ids))
-                await db.execute(
-                    f"UPDATE recommendations SET status='APPROVED', reviewed_at=? "
-                    f"WHERE id IN ({placeholders})",
-                    [now] + ids,
-                )
-                await db.commit()
-
-            # Return the updated records
             if not ids:
                 return []
+
+            placeholders = ",".join("?" * len(ids))
+            await db.execute(
+                f"UPDATE recommendations SET status='STAGED', reviewed_at=? "
+                f"WHERE id IN ({placeholders})",
+                [now] + ids,
+            )
+            await db.commit()
+
             async with db.execute(
-                f"{_SELECT} WHERE id IN ({','.join('?' * len(ids))})", ids
+                f"{_SELECT} WHERE id IN ({placeholders})", ids
             ) as cur:
                 return [_row_to_rec(row) for row in await cur.fetchall()]
 

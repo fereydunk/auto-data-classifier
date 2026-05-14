@@ -41,10 +41,11 @@ from store import RecommendationStore
 from catalog_client import (
     CatalogNotConfiguredError,
     REQUIRED_SR_ENV_VARS,
-    apply_tag,
+    _resolve_version,
     apply_tags_batch,
 )
-from sr_schema import fetch_field_paths_cached
+from sr_schema import fetch_field_paths_cached, fetch_schema_meta_cached
+import asyncio
 import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -74,7 +75,7 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 @app.get("/recommendations", response_model=List[Recommendation])
 async def list_recommendations(
-    status: Optional[str] = Query(None, description="Filter by status: PENDING, APPROVED, REJECTED"),
+    status: Optional[RecommendationStatus] = Query(None, description="Filter by status: PENDING, STAGED, APPROVED, REJECTED"),
     topic: Optional[str] = Query(None, description="Filter by Kafka topic"),
     tag: Optional[str] = Query(None, description="Filter by proposed tag, e.g. PII"),
     tier: Optional[str] = Query(None, description="Filter by confidence tier: HIGH, MEDIUM, LOW"),
@@ -83,7 +84,10 @@ async def list_recommendations(
     Returns all recommendations sorted by confidence descending.
     HIGH-confidence items appear first — apply those in bulk, review the rest manually.
     """
-    return await store.list_recommendations(status=status, topic=topic, tag=tag, tier=tier)
+    return await store.list_recommendations(
+        status=status.value if status else None,
+        topic=topic, tag=tag, tier=tier,
+    )
 
 
 @app.get("/recommendations/summary", response_model=List[RecommendationSummary])
@@ -187,6 +191,7 @@ async def delete_recommendations_by_topic(topic: str = Query(..., description="T
     if not topic:
         raise HTTPException(status_code=400, detail="topic query param required")
     count = await store.delete_by_topic(topic)
+    logger.info("delete_recommendations_by_topic: topic=%s deleted=%d", topic, count)
     return {"topic": topic, "deleted": count}
 
 
@@ -205,6 +210,13 @@ async def reject(rec_id: str, reviewed_by: Optional[str] = Query(None)):
 # ---------------------------------------------------------------------------
 # Submit staged (batch push to Stream Catalog)
 # ---------------------------------------------------------------------------
+# Single-flight lock around the read-staged → POST-catalog → flip-status
+# sequence. Without this, two concurrent /submit-staged calls each fetch the
+# same STAGED set and POST the same payload to Atlas (double tag application,
+# double schema-version bump). One request at a time is plenty for review UX.
+_submit_lock = asyncio.Lock()
+
+
 async def _submit_staged_impl(reviewed_by: Optional[str]) -> List[Recommendation]:
     """Push every STAGED recommendation to Stream Catalog in a single POST.
 
@@ -215,6 +227,11 @@ async def _submit_staged_impl(reviewed_by: Optional[str]) -> List[Recommendation
     auto-REJECTED (with reviewed_by="auto: <reason>") instead of being
     silently dropped — the reviewer sees what happened in the UI.
     """
+    async with _submit_lock:
+        return await _submit_staged_locked(reviewed_by)
+
+
+async def _submit_staged_locked(reviewed_by: Optional[str]) -> List[Recommendation]:
     staged = await store.list_recommendations(status=RecommendationStatus.STAGED.value)
     if not staged:
         return []
@@ -312,9 +329,12 @@ async def validate_staged():
     stale: list[dict] = []
 
     async with httpx.AsyncClient() as client:
-        # Resolve each (subject, schema_id) → version once, then field-paths once.
+        # Resolve each (subject, schema_id) → version once. Mirror submit-staged's
+        # full criterion: version exists AND field paths fetched AND record
+        # qualifier extractable AND clean_path in valid set. If any check fails
+        # the row would be auto-rejected on submit; flag it stale here so the UI
+        # warns BEFORE the user clicks Submit.
         version_cache: dict[tuple[str, Optional[int]], Optional[int]] = {}
-        from catalog_client import _resolve_version  # local import: same package
         for r in staged:
             v_key = (r.subject, r.schema_id)
             if v_key not in version_cache:
@@ -329,8 +349,9 @@ async def validate_staged():
                 })
                 continue
             paths = await fetch_field_paths_cached(client, sr_url, auth, r.subject, version)
+            sid, qualifier = await fetch_schema_meta_cached(client, sr_url, auth, r.subject, version)
             clean = r.field_path.replace("[", ".").replace("]", "").strip(".")
-            if not paths:
+            if not paths or sid is None or not qualifier:
                 stale.append({
                     "id": r.id, "subject": r.subject, "field_path": r.field_path,
                     "reason": "could not fetch/parse SR schema",
@@ -347,21 +368,19 @@ async def validate_staged():
 
 
 # ---------------------------------------------------------------------------
-# Legacy bulk-approve — kept for backward compat with the bulk approve flow
-# we built before staging existed. Behaves like staging then submitting.
+# Bulk-approve = stage everything matching the threshold, then submit the batch.
+# Goes PENDING→STAGED directly (no PENDING→APPROVED→STAGED dance) so a crash
+# between bulk_stage and _submit_staged_impl leaves rows safely STAGED, not
+# falsely APPROVED.
 # ---------------------------------------------------------------------------
 @app.post("/recommendations/bulk-approve", response_model=List[Recommendation])
 async def bulk_approve(req: BulkApproveRequest):
     """Stage everything above min_confidence then submit the batch to SR."""
-    staged = await store.bulk_approve(
+    await store.bulk_stage(
         min_confidence=req.min_confidence,
         topic=req.topic,
         tag=req.tag,
     )
-    # bulk_approve in the store still flips PENDING→APPROVED; flip them back
-    # to STAGED so the impl picks them up. Cheaper than rewriting store.py.
-    for rec in staged:
-        await store.update_status(rec.id, RecommendationStatus.STAGED, None)
     try:
         return await _submit_staged_impl(None)
     except CatalogNotConfiguredError as e:

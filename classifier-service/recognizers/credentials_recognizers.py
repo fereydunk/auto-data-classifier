@@ -53,9 +53,11 @@ class ConnectionStringRecognizer(PatternRecognizer):
 
 
 class GenericAPIKeyRecognizer(PatternRecognizer):
-    """
-    Common API key formats (hex or base62, 32–64 chars).
-    Low confidence alone — intended to complement GLiNER context detection.
+    """Common API key shapes (hex or base62, 32–64 chars).
+
+    Bare hex matches every MD5 / SHA-1 / SHA-256 / git commit / Mongo
+    ObjectId in the world. Base score is below the recommendation publish
+    threshold; Presidio boosts when an api-key context word is nearby.
     Ethereum (0x + 40 hex) and Bitcoin addresses are excluded; those are
     handled by CryptoWalletRecognizer with higher confidence.
     """
@@ -64,18 +66,27 @@ class GenericAPIKeyRecognizer(PatternRecognizer):
             name="API_KEY_HEX",
             # 32-64 lowercase hex chars, but NOT 0x-prefixed (crypto wallets)
             regex=r"(?<!0x)\b[a-f0-9]{32,64}\b",
-            score=0.35,
+            score=0.18,    # below publish threshold without context
         ),
         Pattern(
             name="API_KEY_ALPHANUM",
             # Mixed-case alphanumeric 40-64 chars, not starting with 0x or eyJ (JWT handled separately)
             regex=r"\b(?!0x)(?!eyJ)[A-Za-z0-9]{40,64}\b",
-            score=0.30,
+            score=0.18,
         ),
     ]
 
+    CONTEXT = [
+        "api_key", "apikey", "api-key", "token", "secret", "bearer",
+        "authorization", "access_token", "key",
+    ]
+
     def __init__(self):
-        super().__init__(supported_entity="API_KEY", patterns=self.PATTERNS)
+        super().__init__(
+            supported_entity="API_KEY",
+            patterns=self.PATTERNS,
+            context=self.CONTEXT,
+        )
 
 
 def get_credentials_recognizers():

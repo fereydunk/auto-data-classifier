@@ -63,6 +63,13 @@ def build_ai_analyzer() -> AnalyzerEngine:
     """
     Layer 3: spaCy NER + GLiNER — contextual, zero-shot named entity recognition.
     Handles unstructured free-text that regex cannot reliably classify.
+
+    GLiNER is heavy (~500 MB model download, ~2-8 s per inference on Mac).
+    If the model fails to load (no internet, disk full, transient HuggingFace
+    outage), keep going with spaCy alone instead of refusing to start the
+    whole service. Layer 3 will still work for entities spaCy detects (PERSON,
+    LOCATION, ORG, …) but lose GLiNER's broader entity vocabulary. A WARN log
+    surfaces the degradation so operators notice.
     """
     logger.info("Loading spaCy model…")
     nlp_config = {
@@ -75,8 +82,15 @@ def build_ai_analyzer() -> AnalyzerEngine:
     registry = RecognizerRegistry()
     registry.load_predefined_recognizers(nlp_engine=nlp_engine)
 
-    logger.info("Loading GLiNER model (local)…")
-    registry.add_recognizer(GLiNERRecognizer())
+    try:
+        logger.info("Loading GLiNER model (local)…")
+        registry.add_recognizer(GLiNERRecognizer())
+    except Exception as e:    # noqa: BLE001
+        logger.warning(
+            "GLiNER unavailable — Layer 3 will run with spaCy only "
+            "(reduced coverage on biometric/genetic/financial detection). "
+            "Cause: %s", e,
+        )
 
     logger.info("AI analyzer ready — %d recognizers loaded.", len(registry.recognizers))
     return AnalyzerEngine(registry=registry, nlp_engine=nlp_engine, supported_languages=["en"])

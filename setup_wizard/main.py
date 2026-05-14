@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import struct
@@ -39,6 +40,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -250,8 +252,14 @@ def _upsert_env_values(path: Path, updates: dict[str, str], *,
 
     text = path.read_text()
     for key, raw_val in updates.items():
-        # Quote any value containing whitespace or special chars
-        val = raw_val if re.match(r'^[A-Za-z0-9_./:@-]*$', raw_val) else f'"{raw_val}"'
+        if "\n" in raw_val or "\r" in raw_val:
+            raise ValueError(f"refusing to write multi-line value for {key}")
+        # shlex.quote handles embedded quotes, spaces, and shell metachars
+        # safely; the previous "wrap in double quotes if not bare-alnum"
+        # heuristic corrupted any value containing a literal '"'. For bare
+        # alphanumeric values shlex.quote is a no-op (no quoting added),
+        # so the file stays readable.
+        val = shlex.quote(raw_val)
         new_line = f'{key}={val}'
         # Same `[ \t]` (not `\s`) reasoning as _read_env_value — avoid matching
         # across line boundaries when the existing value is empty.
@@ -427,9 +435,29 @@ def _write_demo_config(*, env_id: str, env_name: str,
 # FastAPI app
 # ──────────────────────────────────────────────────────────────────────────────
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """On shutdown, kill the classifier/ngrok/results-bridge children we spawned.
+
+    Without this, Ctrl-C on uvicorn leaves orphaned processes holding port 8000,
+    the ngrok 4040 admin port, and the demo Kafka consumer group. The next
+    wizard launch then port-collides silently and the second consumer joins
+    the old group, double-reading the topic.
+    """
+    yield
+    try:
+        _stop_all()
+    except Exception as e:    # noqa: BLE001
+        # Don't block shutdown on cleanup errors — the OS will eventually
+        # reap the children either way.
+        import logging as _l
+        _l.getLogger("setup_wizard").warning("lifespan cleanup error: %s", e)
+
+
 app = FastAPI(
     title="auto-data-classifier setup wizard",
     version="0.1.0",
+    lifespan=_lifespan,
 )
 
 
@@ -650,13 +678,20 @@ def _start_classifier_service() -> None:
     _demo_emit("starting classifier-service on :8000 (GLiNER loads on first start, ~60s) …")
     log_path = REPO_ROOT / "scripts" / "logs"
     log_path.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        [str(venv_uvicorn), "main:app", "--host", "0.0.0.0", "--port", str(CLASSIFIER_PORT)],
-        cwd=str(CLASSIFIER_DIR),
-        env={**os.environ, "PYTHONPATH": str(CLASSIFIER_DIR)},
-        stdout=open(log_path / "classifier.log", "ab"),
-        stderr=subprocess.STDOUT,
-    )
+    # Truncate per run (was append-binary) so the log doesn't grow unbounded
+    # across sessions. classifier.log captures every payload routed through
+    # the service — treat as PII; gitignored is necessary but not sufficient,
+    # operators should periodically purge scripts/logs/.
+    # Open in a `with` so the parent fd closes after Popen dups it.
+    with open(log_path / "classifier.log", "wb") as logf:
+        proc = subprocess.Popen(
+            [str(venv_uvicorn), "main:app", "--host", "0.0.0.0", "--port", str(CLASSIFIER_PORT)],
+            cwd=str(CLASSIFIER_DIR),
+            env={**os.environ, "PYTHONPATH": str(CLASSIFIER_DIR)},
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # so Ctrl-C on uvicorn doesn't immediately kill the child
+        )
     _demo_state["classifier_proc"] = proc
 
     # Poll /health
@@ -701,11 +736,13 @@ def _start_ngrok() -> None:
     _demo_emit("starting ngrok http 8000 …")
     log_path = REPO_ROOT / "scripts" / "logs" / "ngrok.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        ["ngrok", "http", str(CLASSIFIER_PORT), "--log=stdout"],
-        stdout=open(log_path, "ab"),
-        stderr=subprocess.STDOUT,
-    )
+    with open(log_path, "wb") as logf:    # truncate per run + close parent fd after dup
+        proc = subprocess.Popen(
+            ["ngrok", "http", str(CLASSIFIER_PORT), "--log=stdout"],
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     _demo_state["ngrok_proc"] = proc
 
     deadline = time.time() + 30
@@ -945,11 +982,12 @@ def _create_demo_topic() -> None:
     # carrying field names from a previous run's random schema pick).
     _wipe_review_recommendations()
 
-    # Step 1: SR subject. Do this FIRST so we don't briefly have a topic
-    # without a schema while creating downstream consumers.
-    _delete_demo_subject()
-
-    # Step 2: delete topic (idempotent — ignore "not found").
+    # Step 1: delete topic FIRST. If we deleted the SR subject first and then
+    # topic-delete failed (transient broker error), the topic would survive
+    # full of bytes encoded against a now-deleted schema_id — un-decodable by
+    # any consumer. Topic-first means in the worst case we lose the new
+    # schema (recoverable: re-register on next attempt) but never end up with
+    # un-decodable data sitting on a live topic. Idempotent — ignore "not found".
     rc_del, _, err_del = _run_confluent(
         ["kafka", "topic", "delete", DEMO_SOURCE_TOPIC, "--force",
          "--cluster", cluster_id, "--environment", env_id],
@@ -964,6 +1002,9 @@ def _create_demo_topic() -> None:
     else:
         # Don't fail hard — try to create anyway.
         _demo_emit(f"warn: topic delete returned {err_del.strip()[:200]} — continuing")
+
+    # Step 2: now safe to drop the SR subject (no live topic referencing it).
+    _delete_demo_subject()
 
     # Step 3: create fresh topic.
     rc, _, err = _run_confluent(
@@ -1025,6 +1066,28 @@ def _register_demo_schema() -> int:
         "Authorization": f"Basic {auth_b64}",
     }
     headers_get = {"Authorization": f"Basic {auth_b64}"}
+
+    # Reset subject mode + compatibility before register. If a prior session
+    # left the subject in IMPORT/READONLY mode (manual SR work, schema-link
+    # exporter), or set BACKWARD compatibility globally, the new schema can
+    # 409. The demo subject is ephemeral by design — wipe its config first.
+    # 404 from these endpoints is fine (no per-subject override means we
+    # already inherit the global default).
+    for path, body in (
+        (f"{base}/mode/{subject}",   '{"mode":"READWRITE"}'),
+        (f"{base}/config/{subject}", '{"compatibility":"NONE"}'),
+    ):
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(path, data=body.encode(),
+                                       headers=headers_post, method="PUT"),
+                timeout=10,
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                _demo_emit(f"warn: {path} returned {exc.code} — continuing")
+        except urllib.error.URLError:
+            pass    # SR unreachable — register will fail with a clearer error below
 
     # POST → register
     req = urllib.request.Request(
@@ -1234,13 +1297,15 @@ def _start_results_bridge() -> None:
     venv_python = REPO_ROOT / ".venv" / "bin" / "python"
     log_path = REPO_ROOT / "scripts" / "logs" / "results-bridge.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        [str(venv_python), "-m", "setup_wizard.results_bridge",
-         "--topic", DEMO_SOURCE_TOPIC],
-        cwd=str(REPO_ROOT),
-        stdout=open(log_path, "ab"),
-        stderr=subprocess.STDOUT,
-    )
+    with open(log_path, "wb") as logf:    # truncate per run + close parent fd after dup
+        proc = subprocess.Popen(
+            [str(venv_python), "-m", "setup_wizard.results_bridge",
+             "--topic", DEMO_SOURCE_TOPIC],
+            cwd=str(REPO_ROOT),
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     _demo_state["bridge_proc"] = proc
     _demo_emit(f"results bridge started (pid {proc.pid}, log scripts/logs/results-bridge.log)")
 
@@ -1405,9 +1470,13 @@ def _stop_all() -> dict:
 
 @app.post("/demo/start-ai")
 async def demo_start_ai():
+    # Set the phase WHILE holding the lock so a second concurrent request can't
+    # pass the gate before the worker thread starts. Previously the lock was
+    # released before Thread.start(), letting two tabs both spawn workers.
     with _demo_lock:
         if _demo_state["phase"] in ("starting_ai", "starting_demo"):
             raise HTTPException(status_code=409, detail=f"already in phase {_demo_state['phase']}")
+        _demo_state["phase"] = "starting_ai"
     threading.Thread(target=_ai_worker, daemon=True).start()
     return {"status": "starting"}
 
@@ -1422,11 +1491,15 @@ async def demo_start_test(field_count: int = 20):
             status_code=400,
             detail=f"field_count must be between {MIN_FIELDS} and {MAX_FIELDS}, got {field_count}",
         )
+    # Set the phase WHILE holding the lock so a second tab can't pass the gate
+    # before the worker thread starts. The previous race let both tabs spawn
+    # workers that raced topic-delete against topic-create.
     with _demo_lock:
         if _demo_state["phase"] in ("starting_ai", "starting_demo"):
             raise HTTPException(status_code=409, detail=f"already in phase {_demo_state['phase']}")
         if _demo_state["phase"] not in ("ai_ready", "demo_running"):
             raise HTTPException(status_code=400, detail="run /demo/start-ai first (Card 4)")
+        _demo_state["phase"] = "starting_demo"
         _demo_state["field_count"] = field_count
     threading.Thread(target=_demo_worker, daemon=True).start()
     return {"status": "starting", "field_count": field_count}

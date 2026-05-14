@@ -8,6 +8,8 @@ import org.apache.flink.table.annotation.FunctionHint;
 import org.apache.flink.table.functions.FunctionContext;
 import org.apache.flink.table.functions.TableFunction;
 import org.apache.flink.types.Row;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -16,6 +18,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Flink UDTF — Layer 1/2/3 field classifier.
@@ -44,9 +47,15 @@ import java.util.Map;
 ))
 public class ClassifyFieldsUDF extends TableFunction<Row> {
 
+    private static final Logger LOG = LoggerFactory.getLogger(ClassifyFieldsUDF.class);
+    // Throttle the WARN logs so a downed classifier doesn't fill TaskManager logs.
+    private static final long ERROR_LOG_INTERVAL_MS = 60_000;
+
     // HttpClient is thread-safe and expensive to create — initialised once in open()
     private transient HttpClient httpClient;
     private transient ObjectMapper mapper;
+    private transient AtomicLong lastErrorLoggedMs;
+    private transient AtomicLong errorCounter;
 
     @Override
     public void open(FunctionContext context) {
@@ -54,6 +63,19 @@ public class ClassifyFieldsUDF extends TableFunction<Row> {
             .connectTimeout(Duration.ofSeconds(5))
             .build();
         this.mapper = new ObjectMapper();
+        this.lastErrorLoggedMs = new AtomicLong(0);
+        this.errorCounter = new AtomicLong(0);
+    }
+
+    private void logErrorThrottled(String msg, Throwable t) {
+        errorCounter.incrementAndGet();
+        long now = System.currentTimeMillis();
+        long last = lastErrorLoggedMs.get();
+        if (now - last >= ERROR_LOG_INTERVAL_MS && lastErrorLoggedMs.compareAndSet(last, now)) {
+            long count = errorCounter.getAndSet(0);
+            LOG.warn("ClassifyFieldsUDF: {} ({} similar in last {}s)",
+                     msg, count, ERROR_LOG_INTERVAL_MS / 1000, t);
+        }
     }
 
     /**
@@ -83,7 +105,10 @@ public class ClassifyFieldsUDF extends TableFunction<Row> {
                 request, HttpResponse.BodyHandlers.ofString()
             );
 
-            if (response.statusCode() != 200) return;
+            if (response.statusCode() != 200) {
+                logErrorThrottled("classifier returned " + response.statusCode(), null);
+                return;
+            }
 
             JsonNode responseNode = mapper.readTree(response.body());
             JsonNode detectedEntities = responseNode.get("detected_entities");
@@ -130,8 +155,10 @@ public class ClassifyFieldsUDF extends TableFunction<Row> {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (Exception e) {
-            // Silently skip unparseable messages or transient HTTP failures
-            // — the scanner is best-effort: missing one message is fine
+            // Throttled-WARN so a downed classifier doesn't spam TaskManager
+            // logs — but operators get *some* signal that the scan is emitting
+            // zero rows because of an upstream failure, not because nothing matched.
+            logErrorThrottled("classify call failed", e);
         }
     }
 

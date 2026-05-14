@@ -13,6 +13,17 @@ Invocation:
 Stdout: a comma-separated KEY '<name>' VALUE p.`<name>` block ready to
 substitute into the {json_object_fields} placeholder in scan.sql.
 
+Limitation — TOP-LEVEL FIELDS ONLY:
+    Nested records (e.g. `customer.email` inside a Customer struct) are NOT
+    expanded. Only the top-level field name (`customer`) is emitted; the
+    classifier receives the nested object as a JSON value and DOES walk it
+    server-side when classifying. The Atlas qualifiedName built by
+    review-api/catalog_client.py, however, uses the top-level name. If you
+    need per-leaf tags on a nested topic, this script needs recursion
+    (emit `KEY 'customer.email' VALUE p.customer.email`) and the field
+    walker in tag application would need the same. Not implemented today
+    because every demo schema is flat.
+
 Failure modes:
     - SR fetch fails / non-200 → exit 2 with stderr message
     - Schema is not Avro → exit 3 (JSON/Protobuf not yet supported here)

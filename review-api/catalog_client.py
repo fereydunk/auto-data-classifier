@@ -117,7 +117,14 @@ async def _resolve_version(
     subject: str,
     schema_id: Optional[int],
 ) -> Optional[int]:
-    """Resolve schema_id → version, or fall back to latest."""
+    """Resolve schema_id → version, or fall back to latest if schema_id is None.
+
+    When schema_id is set, we require an exact match — silently falling back to
+    'latest' on a transient SR error would tag the field against a different
+    schema_id than the recommendation was created with, producing
+    qualifiedNames that don't match the entity the reviewer thought they were
+    tagging. Return None on any failure; the caller will drop the item.
+    """
     if schema_id is not None:
         try:
             resp = await client.get(f"{sr_base}/subjects/{subject}/versions", auth=auth)
@@ -128,10 +135,17 @@ async def _resolve_version(
                 )
                 if detail.status_code == 200 and detail.json().get("id") == schema_id:
                     return v
+            logger.warning(
+                "Schema id %d not found in any version of '%s' — dropping",
+                schema_id, subject,
+            )
         except httpx.HTTPError as e:
-            logger.warning("Version lookup failed for schema %d: %s — falling back to latest", schema_id, e)
+            logger.warning(
+                "Version lookup failed for '%s' schema_id=%d: %s — dropping (no fallback)",
+                subject, schema_id, e,
+            )
+        return None
 
-    # Fall back to latest
     try:
         resp = await client.get(f"{sr_base}/subjects/{subject}/versions/latest", auth=auth)
         resp.raise_for_status()
@@ -274,82 +288,3 @@ async def apply_tags_batch(items: List[dict]) -> tuple[bool, str, list[dict]]:
                 f"subject. Raw: {body}"
             ), dropped
         return False, f"catalog returned {resp.status_code}: {body}", dropped
-
-
-async def apply_tag(
-    subject: str,
-    schema_id: Optional[int],
-    field_path: str,
-    tag_name: str,
-    entity_type: str,
-) -> bool:
-    """
-    Apply a single tag to a schema field in the Confluent Stream Catalog.
-    Returns True on success (including 409 already-exists), False on error.
-    """
-    missing = [v for v in REQUIRED_SR_ENV_VARS if not os.environ.get(v)]
-    if missing:
-        raise CatalogNotConfiguredError(
-            "Stream Catalog not configured — missing env vars: "
-            + ", ".join(missing)
-        )
-
-    sr_url     = os.environ["CONFLUENT_SR_URL"].rstrip("/")
-    sr_api_key = os.environ["CONFLUENT_SR_API_KEY"]
-    sr_secret  = os.environ["CONFLUENT_SR_API_SECRET"]
-    cluster_id = os.environ["CONFLUENT_SR_CLUSTER_ID"]
-    auth = (sr_api_key, sr_secret)
-
-    async with httpx.AsyncClient() as client:
-        await _ensure_tag_definitions(client, sr_url, auth)
-        version = await _resolve_version(client, sr_url, auth, subject, schema_id)
-        if version is None:
-            logger.error("Cannot tag field '%s' — schema version unresolvable", field_path)
-            return False
-
-        # Strip array indices  e.g. "items[0].name" → "items.name"
-        clean_path = field_path.replace("[", ".").replace("]", "").strip(".")
-
-        # Verify the field exists in the LIVE SR schema before POST. Fail
-        # closed if we couldn't read the schema — never trust a stored path.
-        valid_paths = await fetch_field_paths_cached(client, sr_url, auth, subject, version)
-        sid, record_qualifier = await fetch_schema_meta_cached(client, sr_url, auth, subject, version)
-        if not valid_paths or sid is None or not record_qualifier:
-            logger.warning(
-                "apply_tag dropped: could not fetch/parse SR schema for '%s' v%d",
-                subject, version,
-            )
-            return False
-        if clean_path not in valid_paths:
-            logger.warning(
-                "apply_tag dropped: field '%s' not in SR schema for '%s' v%d",
-                clean_path, subject, version,
-            )
-            return False
-
-        qualified_name = _field_qualified_name(cluster_id, sid, record_qualifier, clean_path)
-
-        payload = [
-            {
-                "entityType": SR_FIELD_TYPE,
-                "entityName": qualified_name,
-                "typeName": tag_name,
-            }
-        ]
-
-        try:
-            resp = await client.post(
-                f"{sr_url}/catalog/v1/entity/tags",
-                json=payload,
-                auth=auth,
-            )
-            if resp.status_code in (200, 201, 204, 409):
-                logger.info(
-                    "Tagged '%s' (subject=%s v%d) → %s", field_path, subject, version, tag_name
-                )
-                return True
-            logger.warning("Unexpected status %d tagging '%s': %s", resp.status_code, field_path, resp.text)
-            return False
-        except httpx.HTTPError as e:
-            logger.error("Catalog API error tagging '%s': %s", field_path, e)
-            return False

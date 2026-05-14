@@ -39,6 +39,30 @@ SQL_TEMPLATE="${SCANNER_DIR}/sql/scan.sql"
 : "${SR_KEY:?Set SR_KEY in scan.env}"
 : "${SR_SECRET:?Set SR_SECRET in scan.env}"
 
+# Drift check defined here, called from the start path further down.
+check_connection_url_drift() {
+    local conn_endpoint
+    conn_endpoint=$(confluent flink connection describe classifier-service \
+        --environment "${CONFLUENT_ENVIRONMENT}" \
+        --cloud "${CONFLUENT_CLOUD_PROVIDER}" \
+        --region "${CONFLUENT_CLOUD_REGION}" \
+        --output json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('endpoint') or '')
+except Exception:
+    pass" 2>/dev/null || true)
+    if [[ -n "${conn_endpoint}" && "${conn_endpoint%/}" != "${CLASSIFIER_URL%/}" ]]; then
+        echo "ERROR: CLASSIFIER_URL drift detected." >&2
+        echo "  scan.env CLASSIFIER_URL : ${CLASSIFIER_URL}" >&2
+        echo "  classifier-service conn : ${conn_endpoint}" >&2
+        echo "Update the connection with 'confluent flink connection delete classifier-service'" >&2
+        echo "then re-create it pointing at ${CLASSIFIER_URL}, OR update scan.env to match." >&2
+        exit 2
+    fi
+}
+
 # Statement names — predictable so we can stop/describe them later
 STMT_A="${SOURCE_TOPIC}-scan-trigger-scheduled"
 STMT_B="${SOURCE_TOPIC}-scan-trigger-schema"
@@ -220,6 +244,7 @@ VALUES ('manual', '${SOURCE_TOPIC}', CURRENT_TIMESTAMP);"
         ;;
 
     start)
+        check_connection_url_drift
         echo "Scan configuration:"
         echo "  Source topic:    ${SOURCE_TOPIC}"
         echo "  Scan interval:   every ${SCAN_INTERVAL_MINUTES} minute(s)    [scheduled trigger]"

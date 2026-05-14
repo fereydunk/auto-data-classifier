@@ -29,14 +29,20 @@ FREE_TEXT_VALUE_MIN_WORDS = 6   # values with this many words are treated as fre
 
 
 def is_free_text(field_name: str, value: str) -> bool:
-    """
-    True if the field is likely unstructured free-text.
-    Checked by field name first (zero data access), then value heuristic.
+    """True if the field is likely unstructured free-text.
+
+    Order:
+      1. Known free-text field name → True (zero data access)
+      2. Field name produced a Layer-1 entity match → False (it's structured —
+         "name: Alice Bob Charlie Doe Eve Frank" should NOT become free-text
+         even though it has 6 words; the field name already told us PII/PERSON)
+      3. Value heuristic — ≥6 whitespace-separated words AND contains a space
     """
     tokens = _tokenize(field_name)
     if any(t in FREE_TEXT_FIELD_NAMES for t in tokens):
         return True
-    # Value heuristic — only reached if field name gave no signal
+    if classify_field_name(field_name):
+        return False
     return len(value.split()) >= FREE_TEXT_VALUE_MIN_WORDS and " " in value
 
 
