@@ -13,7 +13,7 @@ Usage:
         --sr-url      https://psrc-xxx.us-east-2.aws.confluent.cloud \\
         --sr-key      SR_API_KEY \\
         --sr-secret   SR_API_SECRET \\
-        --topic       customer-profiles-demo \\
+        --topic       <SOURCE_TOPIC> \\
         --schema-id   100123 \\
         --count       200
 """

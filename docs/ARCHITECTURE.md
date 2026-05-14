@@ -550,7 +550,7 @@ setup_wizard.schema_builder.build_demo_schema(N)
         ▼
 {type: record, name: DemoRecord, namespace: io.confluent.scanner.demo, fields: [...]}
         │
-        │  POST /subjects/customer-profiles-demo-value/versions
+        │  POST /subjects/{source_topic}-value/versions
         ▼
 SR returns new schema_id
         │
@@ -566,12 +566,14 @@ the producer only ever sees the canonical body fetched back from SR.
 
 ### Clean-slate reset per demo run
 
-Before building the new schema, `_create_demo_topic()` performs:
+Before building the new schema, `_create_demo_topic()` performs (where
+`{topic}` is the source topic name from Card 3's text box — the wizard's
+single source of truth):
 
-1. `DELETE /recommendations?topic=customer-profiles-demo` — wipes review-api state
-2. SR `DELETE /subjects/customer-profiles-demo-value` (soft + `?permanent=true`)
-3. `confluent kafka topic delete customer-profiles-demo --force`
-4. `confluent kafka topic create customer-profiles-demo --partitions 6`
+1. `DELETE /recommendations?topic={topic}` — wipes review-api state
+2. SR `DELETE /subjects/{topic}-value` (soft + `?permanent=true`)
+3. `confluent kafka topic delete {topic} --force`
+4. `confluent kafka topic create {topic} --partitions 6`
 
 Then `_register_demo_schema()` builds + registers + re-fetches.
 

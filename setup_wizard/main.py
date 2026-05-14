@@ -614,9 +614,19 @@ async def cc_env_select(sel: EnvSelection):
 # Demo orchestration (Card 4 — Start AI; Card 5 — Run test demo)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Source topic for the wizard demo. Hardcoded — keeps the demo
-# self-contained and unique from any user-managed topics in the env.
-DEMO_SOURCE_TOPIC = "customer-profiles-demo"
+def _source_topic() -> str:
+    """The single source of truth for the demo topic name.
+
+    Card 3's "Source topic name" text box → /cc/env/select → _write_demo_config
+    → SOURCE_TOPIC in both .env and scan.env. Every Card 5 function reads
+    this value, so changing the topic in Card 3 propagates everywhere
+    (kafka topic name, SR subject, Flink statement names, results-bridge
+    --topic arg, review-api filter, etc.).
+
+    Returns "raw-messages" as a last-resort default only if scan.env is
+    missing the value — Card 3 always writes it on save.
+    """
+    return _read_env_value(SCAN_ENV_FILE, "SOURCE_TOPIC") or "raw-messages"
 
 CLASSIFIER_DIR     = REPO_ROOT / "classifier-service"
 FLINK_SCANNER_DIR  = REPO_ROOT / "flink-scanner"
@@ -951,7 +961,7 @@ def _delete_demo_subject() -> None:
     if not (sr_url and sr_key and sr_secret):
         raise RuntimeError("Schema Registry creds missing in .env — re-run Card 3")
 
-    subject = f"{DEMO_SOURCE_TOPIC}-value"
+    subject = f"{_source_topic()}-value"
     base = sr_url.rstrip("/")
     auth_b64 = base64.b64encode(f"{sr_key}:{sr_secret}".encode()).decode()
     headers = {"Authorization": f"Basic {auth_b64}"}
@@ -987,14 +997,15 @@ def _wipe_review_recommendations() -> None:
     elsewhere); a connection failure is logged but doesn't fail the demo.
     """
     review_url = os.environ.get("REVIEW_API_URL", "http://localhost:8001")
+    topic = _source_topic()
     try:
         req = urllib.request.Request(
-            f"{review_url.rstrip('/')}/recommendations?topic={DEMO_SOURCE_TOPIC}",
+            f"{review_url.rstrip('/')}/recommendations?topic={topic}",
             method="DELETE",
         )
         with urllib.request.urlopen(req, timeout=5) as r:
             data = json.loads(r.read())
-        _demo_emit(f"review-api: wiped {data.get('deleted', 0)} prior rec(s) for {DEMO_SOURCE_TOPIC}")
+        _demo_emit(f"review-api: wiped {data.get('deleted', 0)} prior rec(s) for {topic}")
     except urllib.error.URLError as exc:
         _demo_emit(f"warn: could not reach review-api at {review_url} ({exc}) — continuing")
     except Exception as exc:    # noqa: BLE001
@@ -1010,6 +1021,7 @@ def _create_demo_topic() -> None:
     """
     cluster_id = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_KAFKA_CLUSTER")
     env_id     = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_ENVIRONMENT")
+    topic      = _source_topic()
 
     # Step 0: drop prior recommendations for this topic from review-api so
     # the review UI matches the schema we're about to build (no stale rows
@@ -1023,16 +1035,16 @@ def _create_demo_topic() -> None:
     # schema (recoverable: re-register on next attempt) but never end up with
     # un-decodable data sitting on a live topic. Idempotent — ignore "not found".
     rc_del, _, err_del = _run_confluent(
-        ["kafka", "topic", "delete", DEMO_SOURCE_TOPIC, "--force",
+        ["kafka", "topic", "delete", topic, "--force",
          "--cluster", cluster_id, "--environment", env_id],
         timeout=20,
     )
     if rc_del == 0:
-        _demo_emit(f"topic {DEMO_SOURCE_TOPIC} deleted")
+        _demo_emit(f"topic {topic} deleted")
         # Brokers need a moment to free the topic before recreate succeeds.
         time.sleep(3)
     elif "not found" in err_del.lower() or "does not exist" in err_del.lower():
-        _demo_emit(f"topic {DEMO_SOURCE_TOPIC} not present (clean start)")
+        _demo_emit(f"topic {topic} not present (clean start)")
     else:
         # Don't fail hard — try to create anyway.
         _demo_emit(f"warn: topic delete returned {err_del.strip()[:200]} — continuing")
@@ -1042,7 +1054,7 @@ def _create_demo_topic() -> None:
 
     # Step 3: create fresh topic.
     rc, _, err = _run_confluent(
-        ["kafka", "topic", "create", DEMO_SOURCE_TOPIC,
+        ["kafka", "topic", "create", topic,
          "--partitions", "6",
          "--cluster", cluster_id, "--environment", env_id],
         timeout=20,
@@ -1050,7 +1062,7 @@ def _create_demo_topic() -> None:
     combined = err.lower()
     if rc == 0 or "already exists" in combined:
         _demo_state["topic_created"] = True
-        _demo_emit(f"topic {DEMO_SOURCE_TOPIC} ready")
+        _demo_emit(f"topic {topic} ready")
         return
     raise RuntimeError(f"topic create failed: {err.strip()[:300]}")
 
@@ -1092,7 +1104,7 @@ def _register_demo_schema() -> int:
     schema_dict, fields = build_demo_schema(n_fields)
     _demo_emit(f"built demo schema with {len(fields)} fields ({', '.join(f.name for f in fields[:6])}{'…' if len(fields) > 6 else ''})")
 
-    subject = f"{DEMO_SOURCE_TOPIC}-value"
+    subject = f"{_source_topic()}-value"
     base = sr_url.rstrip('/')
     auth_b64 = base64.b64encode(f"{sr_key}:{sr_secret}".encode()).decode()
     headers_post = {
@@ -1203,7 +1215,8 @@ def _produce_test_messages(count: int = 50) -> None:
 
     import random
     rng = random.Random()
-    _demo_emit(f"producing {count} test messages using SR-canonical schema (id={sid}) …")
+    topic = _source_topic()
+    _demo_emit(f"producing {count} test messages to '{topic}' using SR-canonical schema (id={sid}) …")
 
     # Keep records sparse — leave roughly half the fields null per row so the
     # classifier sees a mix of present/absent fields, like real traffic.
@@ -1218,7 +1231,7 @@ def _produce_test_messages(count: int = 50) -> None:
         buf.write(b"\x00")
         buf.write(struct.pack(">I", sid))
         fastavro.schemaless_writer(buf, parsed, rec)
-        producer.produce(DEMO_SOURCE_TOPIC, buf.getvalue())
+        producer.produce(topic, buf.getvalue())
         if (i + 1) % 10 == 0:
             producer.poll(0)
     producer.flush(timeout=15)
@@ -1257,11 +1270,10 @@ def _start_scan() -> None:
     # region BEFORE we run start_scan.sh — keeps every flink command silent.
     _pin_flink_endpoint()
 
-    # start_scan.sh sources scan.env, which clobbers any env vars we set on
-    # the subprocess. Pin SOURCE_TOPIC to the wizard's demo topic by writing
-    # it into scan.env first. (Card 3's "source topic" input lives in .env
-    # for the streaming kafka-pipeline use case — different scenario.)
-    _upsert_env_values(SCAN_ENV_FILE, {"SOURCE_TOPIC": DEMO_SOURCE_TOPIC})
+    # SOURCE_TOPIC in scan.env is set by Card 3 from the user's text-box
+    # input — start_scan.sh reads it as-is. NO override here. (Earlier code
+    # forced a hardcoded demo topic; that broke the rule that Card 3's
+    # topic name is the single source of truth across the whole wizard.)
 
     # Same clean-slate principle as topic+subject: each demo run gets fresh
     # scan statements built from the CURRENT SR schema. Old statements from
@@ -1305,7 +1317,7 @@ def _wait_for_scan_driver_running(timeout_s: int = 180) -> bool:
     env_id   = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_ENVIRONMENT")
     cloud    = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_PROVIDER") or "aws"
     region   = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_REGION") or "us-east-1"
-    name = f"{DEMO_SOURCE_TOPIC}-scan-driver"
+    name = f"{_source_topic()}-scan-driver"
 
     deadline = time.time() + timeout_s
     last_status = ""
@@ -1357,7 +1369,7 @@ def _start_results_bridge() -> None:
     with open(log_path, "wb") as logf:    # truncate per run + close parent fd after dup
         proc = subprocess.Popen(
             [str(venv_python), "-m", "setup_wizard.results_bridge",
-             "--topic", DEMO_SOURCE_TOPIC],
+             "--topic", _source_topic()],
             cwd=str(REPO_ROOT),
             stdout=logf,
             stderr=subprocess.STDOUT,
@@ -1521,7 +1533,7 @@ def _demo_worker():
         # Don't mark Card 5 complete until the chain actually delivers.
         # Wave-2 returning means the producer's done, NOT that recommendations
         # have landed — interval-join + classify + bridge POST adds 30-90s.
-        count = _wait_for_first_recommendations(DEMO_SOURCE_TOPIC, timeout_s=180)
+        count = _wait_for_first_recommendations(_source_topic(), timeout_s=180)
         with _demo_lock:
             _demo_state["phase"] = "demo_running"
         if count > 0:
@@ -1567,10 +1579,11 @@ def _stop_all() -> dict:
     cloud  = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_PROVIDER")
     region = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_REGION")
     if env_id and cloud and region:
+        topic = _source_topic()
         for stmt in (
-            f"{DEMO_SOURCE_TOPIC}-scan-trigger-scheduled",
-            f"{DEMO_SOURCE_TOPIC}-scan-trigger-schema",
-            f"{DEMO_SOURCE_TOPIC}-scan-driver",
+            f"{topic}-scan-trigger-scheduled",
+            f"{topic}-scan-trigger-schema",
+            f"{topic}-scan-driver",
         ):
             _run_confluent(
                 ["flink", "statement", "delete", stmt,

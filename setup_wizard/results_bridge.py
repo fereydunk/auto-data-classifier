@@ -10,7 +10,7 @@ upsert (keeps highest confidence per field+tag), so re-processing on
 restart is safe.
 
 CLI:
-    python -m setup_wizard.results_bridge --topic customer-profiles-demo
+    python -m setup_wizard.results_bridge --topic <SOURCE_TOPIC>
 """
 
 from __future__ import annotations
@@ -207,7 +207,7 @@ def run_bridge(*, topic: str, bootstrap: str, kafka_key: str, kafka_secret: str,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--topic", required=True,
-                        help="Source topic (e.g. customer-profiles-demo). "
+                        help="Source topic (the one Flink scans). "
                              "Bridge reads <topic>-scan-results.")
     parser.add_argument("--review-url", default=None,
                         help="Review-api base URL (default: REVIEW_API_URL from .env or http://localhost:8001)")
