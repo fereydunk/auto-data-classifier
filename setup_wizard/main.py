@@ -1438,6 +1438,46 @@ def _ai_worker():
             _demo_state["current_card"] = 0
 
 
+def _wait_for_first_recommendations(topic: str, timeout_s: int = 180) -> int:
+    """Poll review-api until at least one recommendation lands for the topic.
+
+    Why this exists: between wave-2 produce returning and the first
+    recommendation appearing in review-api there's a 30-90s gap with NO
+    visible signal. The chain is:
+      wave-2 produce → Flink interval-join emits (waits for watermark) →
+      classify_fields() UDF runs per row (HTTPS round-trips to classifier) →
+      results written to scan-results topic →
+      bridge consumes → POSTs to review-api
+    Marking Card 5 "complete" before this finishes left the user staring at
+    a green "running" pill and a 0 count in Card 6, with no way to tell if
+    the demo was working or stuck. We poll every 3s and emit progress so
+    the live log shows the wait is intentional. Returns final count (0 on
+    timeout — caller decides whether that's an error).
+    """
+    review_url = (_read_env_value(ENV_FILE, "REVIEW_API_URL") or "http://localhost:8001").rstrip("/")
+    url = f"{review_url}/recommendations?topic={topic}"
+    deadline = time.time() + timeout_s
+    last_emit = 0.0
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                count = len(json.loads(r.read()))
+        except Exception:    # noqa: BLE001 — review-api may be down briefly
+            count = 0
+        if count > 0:
+            _demo_emit(f"✓ {count} recommendation(s) landed in review-api")
+            return count
+        # Emit progress every ~15 s so the user sees we're alive.
+        now = time.time()
+        if now - last_emit >= 15:
+            elapsed = int(now - (deadline - timeout_s))
+            _demo_emit(f"…waiting for Flink scan-driver to emit + bridge to POST "
+                       f"(elapsed {elapsed}s of {timeout_s}s budget)")
+            last_emit = now
+        time.sleep(3)
+    return 0
+
+
 def _demo_worker():
     """Card 5: topic + schema + test data + scan + bridge."""
     with _demo_lock:
@@ -1478,9 +1518,27 @@ def _demo_worker():
         time.sleep(2)
         _produce_test_messages(count=10)
 
+        # Don't mark Card 5 complete until the chain actually delivers.
+        # Wave-2 returning means the producer's done, NOT that recommendations
+        # have landed — interval-join + classify + bridge POST adds 30-90s.
+        count = _wait_for_first_recommendations(DEMO_SOURCE_TOPIC, timeout_s=180)
         with _demo_lock:
             _demo_state["phase"] = "demo_running"
-        _demo_emit("✓ Card 5 complete — demo running. Open Review UI to approve.")
+        if count > 0:
+            _demo_emit(
+                f"✓ Card 5 complete — {count} recommendation(s) ready. "
+                f"Open Review UI to approve."
+            )
+        else:
+            # Don't fail the card — the pipeline IS running; classifications
+            # may still arrive, or they may not (e.g. classifier returned
+            # nothing for these payloads). Give the user a clear next step
+            # instead of misleading "complete" silence.
+            _demo_emit(
+                "⚠ Card 5: scan ran but no recommendations landed in 180s. "
+                "Check 'confluent flink statement list' for scan-driver status, "
+                "or run start_scan.sh --now manually to fire another trigger."
+            )
     except Exception as exc:    # noqa: BLE001
         with _demo_lock:
             _demo_state["phase"] = "error"
