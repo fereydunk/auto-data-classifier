@@ -1384,7 +1384,12 @@ def _ai_worker():
 def _demo_worker():
     """Card 5: topic + schema + test data + scan + bridge."""
     with _demo_lock:
-        if _demo_state["phase"] not in ("ai_ready", "demo_running"):
+        # /demo/start-test now flips phase to "starting_demo" while still
+        # holding the lock (so two tabs can't both pass the gate). By the
+        # time this worker starts, phase is already "starting_demo" — accept
+        # that too, otherwise the worker bails immediately with "Card 4 must
+        # complete first" and the user sees nothing happen on the click.
+        if _demo_state["phase"] not in ("ai_ready", "demo_running", "starting_demo"):
             _demo_emit("ERROR: Card 4 must complete first", card=5)
             return
         _demo_state["phase"] = "starting_demo"
