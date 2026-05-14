@@ -97,7 +97,11 @@ def test_env_select_writes_both_files(wizard_module, client):
             return _fake_completed(stdout=json.dumps(payload), returncode=0)
         return _fake_completed(returncode=1, stderr=f"unexpected cmd: {cmd!r}")
 
-    with patch.object(wizard_module.subprocess, "run", side_effect=fake_run):
+    # _wait_for_sr_key_active probes the real SR endpoint; in tests there's
+    # no real SR to hit, so short-circuit it. Real wizard runs use the actual
+    # probe to wait for CC API key propagation.
+    with patch.object(wizard_module.subprocess, "run", side_effect=fake_run), \
+         patch.object(wizard_module, "_wait_for_sr_key_active", return_value=True):
         resp = client.post("/cc/env/select", json={
             "env_id":             "env-test123",
             "env_name":           "test-env",

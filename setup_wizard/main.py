@@ -213,6 +213,40 @@ def _create_resource_api_key(resource_id: str, env_id: str,
     return {"api_key": key, "api_secret": secret}, ""
 
 
+def _wait_for_sr_key_active(sr_url: str, key: str, secret: str,
+                            timeout_s: int = 30) -> bool:
+    """Block until a freshly-minted SR key is usable.
+
+    CC API keys take 5-15 s to propagate after `api-key create`. If Card 5
+    runs immediately after Card 3 saves, the wizard's first SR call (DELETE
+    /subjects/{topic}-value during clean-slate reset) hits the propagation
+    gap and gets HTTP 401. We probe with GET /subjects (read-only, harmless)
+    until 200 — that proves the key is active and authorized for the SR
+    cluster. Returns True on success, False on timeout. Caller decides
+    whether to fail or proceed.
+    """
+    base = sr_url.rstrip("/")
+    auth = base64.b64encode(f"{key}:{secret}".encode()).decode()
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(
+                f"{base}/subjects",
+                headers={"Authorization": f"Basic {auth}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                # 403, 404, 5xx — surface to caller's timeout.
+                pass
+        except Exception:    # noqa: BLE001
+            pass
+        time.sleep(2)
+    return False
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # .env file helpers (KEY=VALUE format)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -598,6 +632,17 @@ async def cc_env_select(sel: EnvSelection):
     if s_err:
         raise HTTPException(status_code=502, detail=f"SR API key mint failed: {s_err}")
 
+    # Block until the SR key actually works against the cluster. CC API key
+    # propagation takes 5-15 s; without this wait, a fast user click on
+    # Card 5 hits SR with a not-yet-active key → HTTP 401 → Card 5 fails on
+    # the very first SR call (DELETE /subjects/{topic}-value).
+    if not _wait_for_sr_key_active(sr.get("endpoint", ""), sr_keys["api_key"], sr_keys["api_secret"]):
+        raise HTTPException(
+            status_code=502,
+            detail="SR API key minted but not active after 30s — "
+                   "try saving Card 3 again, or check CC org-level API key quotas.",
+        )
+
     return _write_demo_config(
         env_id=sel.env_id,
         env_name=sel.env_name or "",
@@ -967,12 +1012,23 @@ def _delete_demo_subject() -> None:
     headers = {"Authorization": f"Basic {auth_b64}"}
 
     def _delete(url: str) -> tuple[int, str]:
-        try:
-            req = urllib.request.Request(url, headers=headers, method="DELETE")
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return r.status, r.read().decode()
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read().decode()[:200]
+        # Belt-and-suspenders: cc_env_select waits for the SR key to propagate,
+        # but if propagation drifts beyond 30s (rare but seen on org-wide rate
+        # limits) the first call here still hits 401. Retry up to 3 times with
+        # 5/10/15s backoff so the wizard recovers gracefully.
+        for attempt in range(1, 4):
+            try:
+                req = urllib.request.Request(url, headers=headers, method="DELETE")
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode()[:200]
+                if exc.code == 401 and attempt < 3:
+                    _demo_emit(f"SR returned 401 (key propagation lag?) — retrying in {attempt*5}s")
+                    time.sleep(attempt * 5)
+                    continue
+                return exc.code, body
+        return 500, "exhausted retries"
 
     # Soft delete first.
     s_code, s_body = _delete(f"{base}/subjects/{subject}")
@@ -1490,6 +1546,96 @@ def _wait_for_first_recommendations(topic: str, timeout_s: int = 180) -> int:
     return 0
 
 
+def _cleanup_prior_topic(prior: str) -> None:
+    """Tear down everything that belongs to a previously-used topic name.
+
+    Called from _demo_worker when the user changed the topic name in Card 3
+    between runs. Without this, the prior topic's Kafka topic, SR subject,
+    Flink statements (3 long-running ones costing compute pool minutes), and
+    review-api recommendations all leak forever — every topic name change
+    accumulates dead infrastructure.
+
+    Best-effort: each step logs but doesn't fail the new run. The new
+    topic's clean-slate-reset still runs after this returns.
+    """
+    _demo_emit(f"topic name changed → tearing down prior topic '{prior}'…")
+    env_id  = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_ENVIRONMENT")
+    cloud   = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_PROVIDER")
+    region  = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_REGION")
+    cluster = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_KAFKA_CLUSTER")
+
+    # 1. Stop the prior topic's 3 long-running Flink statements (they cost
+    #    money per minute even when the topic they scan is empty/deleted).
+    if env_id and cloud and region:
+        for stmt in (
+            f"{prior}-scan-trigger-scheduled",
+            f"{prior}-scan-trigger-schema",
+            f"{prior}-scan-driver",
+        ):
+            rc, _, err = _run_confluent(
+                ["flink", "statement", "delete", stmt,
+                 "--environment", env_id, "--cloud", cloud, "--region", region, "--force"],
+                timeout=15,
+            )
+            if rc == 0:
+                _demo_emit(f"  prior Flink statement {stmt} stopped")
+            elif "not found" in err.lower() or "does not exist" in err.lower():
+                pass    # already gone — fine
+            else:
+                _demo_emit(f"  warn: could not stop {stmt}: {err.strip()[:120]}")
+
+    # 2. Delete the prior Kafka topic (may not exist if user typed a name
+    #    that was never created — that's fine).
+    if env_id and cluster:
+        rc, _, err = _run_confluent(
+            ["kafka", "topic", "delete", prior, "--force",
+             "--cluster", cluster, "--environment", env_id],
+            timeout=20,
+        )
+        if rc == 0:
+            _demo_emit(f"  prior Kafka topic {prior} deleted")
+        elif "not found" in err.lower() or "does not exist" in err.lower():
+            pass
+        else:
+            _demo_emit(f"  warn: could not delete topic {prior}: {err.strip()[:120]}")
+
+    # 3. Hard-delete the prior SR subject (so the SR namespace is freed and
+    #    a future re-use of the same name starts at v1).
+    sr_url    = _read_env_value(ENV_FILE, "CONFLUENT_SR_URL")
+    sr_key    = _read_env_value(ENV_FILE, "CONFLUENT_SR_API_KEY")
+    sr_secret = _read_env_value(ENV_FILE, "CONFLUENT_SR_API_SECRET")
+    if sr_url and sr_key and sr_secret:
+        base = sr_url.rstrip("/")
+        auth = base64.b64encode(f"{sr_key}:{sr_secret}".encode()).decode()
+        for url in (
+            f"{base}/subjects/{prior}-value",
+            f"{base}/subjects/{prior}-value?permanent=true",
+        ):
+            try:
+                req = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}"}, method="DELETE")
+                with urllib.request.urlopen(req, timeout=10):
+                    pass
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    _demo_emit(f"  warn: SR DELETE returned {exc.code} for {url.rsplit('/',1)[1]}")
+            except Exception:    # noqa: BLE001
+                pass
+        _demo_emit(f"  prior SR subject {prior}-value deleted")
+
+    # 4. Wipe prior review-api recommendations for that topic.
+    review_url = (os.environ.get("REVIEW_API_URL") or _read_env_value(ENV_FILE, "REVIEW_API_URL")
+                  or "http://localhost:8001").rstrip("/")
+    try:
+        req = urllib.request.Request(
+            f"{review_url}/recommendations?topic={prior}", method="DELETE",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read())
+        _demo_emit(f"  prior review-api recs wiped ({data.get('deleted', 0)})")
+    except Exception:    # noqa: BLE001
+        pass    # review-api may not be running yet — fine
+
+
 def _demo_worker():
     """Card 5: topic + schema + test data + scan + bridge."""
     with _demo_lock:
@@ -1504,6 +1650,18 @@ def _demo_worker():
         _demo_state["phase"] = "starting_demo"
         _demo_state["current_card"] = 5
     try:
+        # If the user changed Card 3's topic name between runs, the OLD
+        # topic's Kafka topic + SR subject + Flink statements + recs are
+        # still live. Tear them down BEFORE provisioning the new topic so
+        # we don't accumulate dead infrastructure across topic renames.
+        prior = _read_env_value(SCAN_ENV_FILE, "PRIOR_SOURCE_TOPIC")
+        current = _source_topic()
+        if prior and prior != current:
+            _cleanup_prior_topic(prior)
+        # Record the current topic so the NEXT run knows what to tear down
+        # if the user changes Card 3 again.
+        _upsert_env_values(SCAN_ENV_FILE, {"PRIOR_SOURCE_TOPIC": current})
+
         # Reset per-run counters that accumulate across waves.
         _demo_state["messages_produced"] = 0
         _create_demo_topic()
