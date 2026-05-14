@@ -354,16 +354,7 @@
         const s = data.summary;
         status.innerHTML = `
           <div class="rounded-md bg-emerald-50 border border-emerald-200 px-3 py-2 text-emerald-800">
-            ✓ Saved.<br/>
-            <span class="font-mono text-xs">${escapeHtml(data.env_file)}</span><br/>
-            <span class="font-mono text-xs">${escapeHtml(data.scan_env_file)}</span>
-            <div class="mt-1 text-xs">
-              env <span class="font-mono">${escapeHtml(s.env_id)}</span>,
-              cluster <span class="font-mono">${escapeHtml(s.cluster_id)}</span>,
-              pool <span class="font-mono">${escapeHtml(s.pool_id)}</span>,
-              ${escapeHtml(s.cloud)}/${escapeHtml(s.region)},
-              topic <span class="font-mono">${escapeHtml(s.topic)}</span>
-            </div>
+            ✓ Saved.
           </div>
         `;
       } catch (e) {
