@@ -39,6 +39,17 @@ SQL_TEMPLATE="${SCANNER_DIR}/sql/scan.sql"
 : "${SR_KEY:?Set SR_KEY in scan.env}"
 : "${SR_SECRET:?Set SR_SECRET in scan.env}"
 
+# Pin the CLI's active Flink region + endpoint to match this scan's cluster.
+# Without this, every confluent flink command emits "No Flink endpoint is
+# specified, defaulting to public endpoint: https://flink.<r>.<c>.confluent.cloud".
+# Idempotent — `region use` + `endpoint use` are safe to call repeatedly. We
+# pipe stdout to /dev/null because both commands echo a confirmation that
+# duplicates what the script's actual output already conveys.
+FLINK_ENDPOINT_URL="https://flink.${CONFLUENT_CLOUD_REGION}.${CONFLUENT_CLOUD_PROVIDER}.confluent.cloud"
+confluent flink region use --cloud "${CONFLUENT_CLOUD_PROVIDER}" \
+    --region "${CONFLUENT_CLOUD_REGION}" >/dev/null 2>&1 || true
+confluent flink endpoint use "${FLINK_ENDPOINT_URL}" >/dev/null 2>&1 || true
+
 # Drift check defined here, called from the start path further down.
 check_connection_url_drift() {
     local conn_endpoint

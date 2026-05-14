@@ -34,6 +34,14 @@ JAR="$SCRIPT_DIR/../target/flink-scanner-udf-1.0.0.jar"
 : "${CONFLUENT_CLOUD_REGION:=us-east-1}"
 : "${CONFLUENT_CLOUD_PROVIDER:=aws}"
 
+# Pin CLI's active Flink endpoint to silence "No Flink endpoint is specified,
+# defaulting to public endpoint…" on every subsequent flink command.
+confluent flink region use --cloud "$CONFLUENT_CLOUD_PROVIDER" \
+    --region "$CONFLUENT_CLOUD_REGION" >/dev/null 2>&1 || true
+confluent flink endpoint use \
+    "https://flink.${CONFLUENT_CLOUD_REGION}.${CONFLUENT_CLOUD_PROVIDER}.confluent.cloud" \
+    >/dev/null 2>&1 || true
+
 if [[ ! -f "$JAR" ]]; then
     echo "ERROR: JAR not found. Run ./scripts/build.sh first." >&2
     exit 1

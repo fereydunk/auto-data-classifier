@@ -413,6 +413,18 @@ def _write_demo_config(*, env_id: str, env_name: str,
         "REVIEW_API_URL":              "http://localhost:8001",
     }, header="# Written by setup-wizard. Edit MAX_LAYER / BATCH_SIZE / etc. by hand.\n")
 
+    # Set the CLI's active Flink region + endpoint to match the chosen
+    # cluster. Without this, every subsequent `confluent flink ...` command
+    # emits "No Flink endpoint is specified, defaulting to public endpoint:
+    # https://flink.<region>.<cloud>.confluent.cloud". Two-step: `region use`
+    # first picks the (cloud, region), then `endpoint use` pins the public
+    # endpoint URL. Both are best-effort — if either fails, scripts still
+    # work via per-call --cloud/--region flags, just noisier.
+    if cloud and region:
+        flink_url = f"https://flink.{region}.{cloud}.confluent.cloud"
+        _run_confluent(["flink", "region", "use", "--cloud", cloud, "--region", region])
+        _run_confluent(["flink", "endpoint", "use", flink_url])
+
     # flink-scanner/scan.env — read by flink-scanner/scripts/*.sh and apply_tags.py
     _upsert_env_values(SCAN_ENV_FILE, {
         "CONFLUENT_ENVIRONMENT":    env_id,
