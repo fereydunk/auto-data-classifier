@@ -1233,7 +1233,30 @@ def _produce_test_messages(count: int = 50) -> None:
 
 # ── Card 5 step 4-6: scan + bridge ───────────────────────────────────────────
 
+def _pin_flink_endpoint() -> None:
+    """Pin the CLI's active Flink region+endpoint before any flink command.
+
+    Belt and suspenders with start_scan.sh's own pin: subprocess inheritance
+    or transient `confluent` CLI state can leave the endpoint unpinned, and
+    every flink command then emits "No Flink endpoint is specified" — which
+    is harmless noise but the user has asked us to silence it. Doing it from
+    Python ensures the pin is in place BEFORE we spawn start_scan.sh, so even
+    if that script's own pin is skipped for any reason we still benefit.
+    """
+    cloud  = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_PROVIDER") or "aws"
+    region = _read_env_value(SCAN_ENV_FILE, "CONFLUENT_CLOUD_REGION")
+    if not region:
+        return
+    _run_confluent(["flink", "region", "use", "--cloud", cloud, "--region", region])
+    _run_confluent(["flink", "endpoint", "use",
+                    f"https://flink.{region}.{cloud}.confluent.cloud"])
+
+
 def _start_scan() -> None:
+    # Make sure the CLI's active Flink endpoint is pinned to the cluster's
+    # region BEFORE we run start_scan.sh — keeps every flink command silent.
+    _pin_flink_endpoint()
+
     # start_scan.sh sources scan.env, which clobbers any env vars we set on
     # the subprocess. Pin SOURCE_TOPIC to the wizard's demo topic by writing
     # it into scan.env first. (Card 3's "source topic" input lives in .env

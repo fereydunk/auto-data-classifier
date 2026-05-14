@@ -188,30 +188,46 @@ PYEOF
 }
 
 # Submit a single long-running statement. Always replaces the existing one
-# (delete + poll-until-gone + create) so the SQL stays in sync with the
-# current SR schema. Skip-if-exists left stale SQL in place after a schema
-# rebuild AND raced with CC's eventually-consistent describe.
+# so the SQL stays in sync with the current SR schema.
+#
+# CC's control plane is multi-stage: `describe` returns 404 BEFORE `create`
+# is allowed to recreate the namespace (the namespace stays reserved while
+# the underlying job tears down). Polling on describe is the wrong signal —
+# we'd see "not found" then immediately get "already exists" on create.
+# So instead: delete first, then try create; on "already exists" delete
+# again and retry with backoff. The retry is what actually waits long
+# enough for CC to free the name.
 submit_statement() {
     local name="$1"
     local sql="$2"
 
-    # Best-effort delete; ignore failure (statement may not exist).
+    # Best-effort initial delete; ignore failure (statement may not exist).
     confluent flink statement delete "${name}" "${FLINK_FLAGS_GEO[@]}" --force &>/dev/null || true
+    sleep 3
 
-    # Poll until describe reports the statement is gone — CC's control plane
-    # is eventually-consistent and `create` would fail with "already exists"
-    # if we proceed too eagerly.
-    for _ in $(seq 1 24); do  # up to ~60s
-        if ! confluent flink statement describe "${name}" "${FLINK_FLAGS_GEO[@]}" &>/dev/null; then
-            break
+    local attempt out rc
+    for attempt in 1 2 3 4 5; do
+        out=$(confluent flink statement create "${name}" \
+                  --sql "${sql}" "${FLINK_FLAGS[@]}" 2>&1)
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+            echo "  [ok]   ${name} submitted"
+            return 0
         fi
-        sleep 2.5
+        # Specific-case retry: CC namespace not yet freed after delete.
+        if echo "${out}" | grep -qi "already exists"; then
+            local backoff=$((attempt * 15))
+            echo "  [info] ${name} namespace not yet free in CC, deleting + waiting ${backoff}s (attempt ${attempt}/5)…"
+            confluent flink statement delete "${name}" "${FLINK_FLAGS_GEO[@]}" --force &>/dev/null || true
+            sleep "${backoff}"
+            continue
+        fi
+        # Some other error — fail fast with the actual message.
+        echo "${out}" >&2
+        return $rc
     done
-
-    confluent flink statement create "${name}" \
-        --sql "${sql}" \
-        "${FLINK_FLAGS[@]}"
-    echo "  [ok]   ${name} submitted"
+    echo "  [error] ${name} create failed after 5 attempts (CC namespace stuck)" >&2
+    return 1
 }
 
 # ── Actions ───────────────────────────────────────────────────────────────────
