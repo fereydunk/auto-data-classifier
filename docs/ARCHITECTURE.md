@@ -30,10 +30,12 @@ Both modes use the same three-layer classifier. The Flink scanner writes tags di
 │          │                                        │                     │
 │          │                  Flink SQL (3 statements)                    │
 │          │                  ┌──────────────────────────────────────┐    │
-│          │                  │  A: TUMBLE → scan-triggers           │    │
+│          │                  │  A: TUMBLE → scan-triggers  RUNNING  │    │
 │          ├─────────────────▶│  B: schema_watcher() → scan-triggers │    │
+│          │                  │     RUNNING                           │    │
 │          │                  │  C: scan driver → scan-results        │    │
-│          │                  │     (classify_fields() UDTF)          │    │
+│          │                  │     RUNNING (UDF silently no-ops —    │    │
+│          │                  │     see network constraint below)     │    │
 │          │                  └──────────────────────────────────────┘    │
 └──────────┼──────────────────────────────────────────────────────────────┘
            │
@@ -50,21 +52,83 @@ Both modes use the same three-layer classifier. The Flink scanner writes tags di
 │  └──────────────────────────┘     │       approve | reject           │  │
 │                                   └──────────────────────────────────┘  │
 │                                                                         │
-│  apply_tags.py  (Flink scanner review step)                             │
+│  local_scanner.py  (current E2E path — replaces Flink UDF until EA)    │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  consumer.poll({topic})        ← reads Kafka directly            │  │
+│  │  Avro wire-format decode       ← strips Confluent 5-byte header  │  │
+│  │  POST /classify → classifier   ← runs locally, no egress needed  │  │
+│  │  producer.produce({topic}-scan-results)                          │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  apply_tags.py  (Flink scanner review step — works with both paths)     │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
 │  │  reads {topic}-scan-results  → latest batch                       │  │
 │  │  fetches schema from SR      → extracts existing tags             │  │
-│  │  presents new/changed tags   → [y/n/q] per field                  │  │
+│  │  presents new/changed tags   → [y/n/q] per field (or --yes)      │  │
 │  │  patches schema (AVRO/JSON Schema/Protobuf)                       │  │
 │  │  registers new schema version in SR                               │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │  classifier-service (:8000)                                             │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  POST /classify  [same as before]                                 │  │
+│  │  POST /classify  [same for both modes]                            │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Flink compute pool — network egress constraint
+
+Confluent Cloud Flink compute pools have **no outbound internet access**. UDFs execute inside the pool and cannot open TCP connections to external endpoints — not to public URLs, ngrok tunnels, or Cloudflare tunnels. This is a platform-level restriction, not a configuration issue.
+
+**Impact:** `classify_fields()` UDF calls `POST /classify` internally. The HTTP connection attempt always times out. The UDF swallows the exception silently (by design — the scanner is best-effort), so Statement C remains RUNNING but emits zero rows to `scan-results`.
+
+**Statements A and B are unaffected** — A uses only native Flink windowing; B calls Schema Registry (reachable from within Confluent Cloud).
+
+### Current workaround — local_scanner.py
+
+`e2e/local_scanner.py` replicates Statement C's logic entirely in Python, running on any machine that can reach both the Kafka cluster and the classifier:
+
+```
+local_scanner.py
+  ├─ Connects to Kafka (Confluent Cloud, SASL_SSL)
+  ├─ Consumes {topic} from beginning with a fresh consumer group
+  ├─ Decodes Confluent Avro wire format (0x00 + 4-byte schema ID + avro bytes)
+  ├─ Calls POST http://localhost:8000/classify for each message
+  ├─ Groups by (field_path, tag) — keeps highest-confidence entity per pair
+  └─ Publishes JSON results to {topic}-scan-results
+       → apply_tags.py reads this topic identically to Flink output
+```
+
+The key invariant: all messages in a single run share **one `scanned_at` timestamp** (set before the loop). `apply_tags.py` groups by `max(scanned_at)` to find the latest batch — if timestamps differ per message, only the last second's results are processed.
+
+### Future — Full Flink UDF path (USING CONNECTIONS, Early Access)
+
+Confluent Cloud Flink is adding a **USING CONNECTIONS** feature that binds a UDF to a Connection object, allowing it to make HTTP calls to public endpoints without private networking:
+
+```sql
+-- 1. Create a Connection object pointing to the classifier
+--    (done once via CLI: confluent flink connection create classifier-service
+--     --type rest --endpoint https://your-classifier.example.com)
+
+-- 2. Re-register classify_fields bound to the connection
+CREATE FUNCTION classify_fields
+  AS 'io.confluent.scanner.ClassifyFieldsUDF'
+  USING JAR 'confluent-artifact://<artifact-id>'
+  USING CONNECTIONS (`classifier-service`);
+```
+
+Once enabled for your organisation, Statement C will classify data natively inside Flink — `local_scanner.py` becomes unnecessary. The `register.sh` script has this command commented out at the bottom waiting for the feature to be enabled.
+
+To request Early Access: ask your Confluent account team or CSE to enable
+`flink.udf.connections` for your org (environment `env-xxxxx`), specifying:
+- Organisation / environment ID
+- Use case: Java TableFunction (`ClassifyFieldsUDF`) calling a REST endpoint
+- The endpoint URL (or ngrok/public proxy)
+
+> Note: during EA, USING CONNECTIONS is supported for Java scalar and table functions.
+> `ClassifyFieldsUDF` extends `TableFunction<Row>` — this is the supported type.
 
 ---
 
@@ -136,7 +200,7 @@ This means end-to-end latency for a small burst of messages is bounded by `consu
     ]
   },
   "layers_used": [1, 2, 3],
-  "classified_at": "2026-04-06T10:00:00+00:00",
+  "classified_at": "2026-04-07T09:00:00+00:00",
   "classifier_version": "3.1.0"
 }
 ```
@@ -169,9 +233,47 @@ Statement C — Scan driver (always running)
   scan-triggers AS t
   JOIN source_topic AS p
     ON p.$rowtime BETWEEN t.triggered_at - INTERVAL 'M' MINUTES AND t.triggered_at
-  → classify_fields(url, max_layer, $value) UDTF
+  → classify_fields(url, max_layer, JSON_OBJECT(...all fields...)) UDTF
   → INSERT INTO scan-results (field_path, tag, confidence, layer, source, example, trigger_type, scanned_at)
 ```
+
+### Scan-results table — append-only design
+
+The `{topic}-scan-results` table is **append-only** (no PRIMARY KEY, no `changelog.mode`). Statement C emits one row per `(field_path, tag)` pair per classified message — no aggregation inside Flink.
+
+Deduplication happens downstream in `apply_tags.py`: it groups all rows from the latest batch by `(field_path, tag)` and keeps the highest-confidence entity per pair. This avoids the watermark deadlock that a GROUP BY inside Flink streaming would cause (aggregates never flush without a time window or all-channel watermark advancement).
+
+```sql
+-- Correct: append-only, no GROUP BY in Flink
+CREATE TABLE IF NOT EXISTS `{topic}-scan-results` (
+    `field_path`    STRING,
+    `tag`           STRING,
+    `confidence`    DOUBLE,
+    `layer`         INT,
+    `source`        STRING,
+    `example`       STRING,
+    `source_topic`  STRING,
+    `trigger_type`  STRING,
+    `scanned_at`    TIMESTAMP_LTZ(3)
+) WITH (
+    'kafka.retention.time' = '604800000'   -- 7 days
+);
+```
+
+### Watermark design — interval join
+
+Statement C uses an **interval join** between scan-triggers and the source topic:
+
+```sql
+FROM `{topic}-scan-triggers` AS t
+JOIN `{topic}` AS p
+  ON p.`$rowtime` BETWEEN t.triggered_at - INTERVAL 'M' MINUTES
+                      AND t.triggered_at
+```
+
+For this join to emit results, the watermark of the source topic must advance past `triggered_at`. This requires fresh data arriving after the trigger fires. The scheduled trigger (Statement A, TUMBLE window) continuously provides new trigger rows — the scan-triggers watermark advances with each window close, keeping the join unblocked during normal operation.
+
+Manual triggers (one-shot INSERT) fire a single row. As long as the source topic has messages arriving within the sample window, the join emits. If the source topic is idle, the join holds until new data arrives.
 
 ### apply_tags.py — human review and schema patching
 
@@ -179,6 +281,8 @@ Statement C — Scan driver (always running)
 apply_tags.py
   │
   ├─ 1. Read {topic}-scan-results → latest scanned_at batch, deduplicated
+  │       Groups by max(scanned_at): all results from local_scanner.py run
+  │       share one timestamp — this is the "latest batch"
   │
   ├─ 2. Fetch schema from SR → detect schema type (AVRO / JSON Schema / Protobuf)
   │       Extract existing (field_path, tag) pairs already in schema
@@ -187,7 +291,7 @@ apply_tags.py
   │       Already in schema → silently skipped
   │       New or changed   → shown for approval
   │
-  ├─ 4. Interactive prompt (new tags only)
+  ├─ 4. Interactive prompt (new tags only)  [--yes skips this step]
   │       [1/N] Field: customer.email  Tag: PII  Confidence: HIGH (0.97)
   │       Approve? [y/n/q]
   │
@@ -209,6 +313,7 @@ apply_tags.py
 - Maintains `lastKnownVersion` as a transient instance variable (persists for the job lifetime; resets on restart)
 - On first successful check: records version, does **not** emit (no baseline to compare)
 - On version increase: emits one row `(triggered_at)` → written to scan-triggers topic
+- SchemaWatcherUDF calls Schema Registry, which is reachable from inside Confluent Cloud — no egress constraint
 
 ### Configuration
 
@@ -325,21 +430,42 @@ string email = 1 [(confluent.field_meta) = {tags: ["PII"]}];
 
 ---
 
-## Confluent Cloud test environment
+## Validated E2E results (Confluent Cloud, April 2026)
 
-The stack was validated end-to-end against the following Confluent Cloud resources:
+The full pipeline was validated end-to-end against a live Confluent Cloud environment:
 
 | Resource | Value |
 |---|---|
-| Environment | DEVTEST |
-| Cluster name | claude-test-cl |
-| Cluster ID | lkc-2pk6ro |
-| Bootstrap servers | pkc-921jm.us-east-2.aws.confluent.cloud:9092 |
-| Schema Registry ID | lsrc-jwp0w |
-| Schema Registry URL | psrc-lq3wm.eu-central-1.aws.confluent.cloud |
-| Topics | raw-messages → classified-messages / classified-safe / classification-audit |
+| Environment | DEVTEST (env-m2qxq) |
+| Flink compute pool | lfcp-dw3qy7 (us-west-2, AWS) |
+| Kafka cluster | lkc-1j6rd3 (us-west-2, AWS) |
+| Schema Registry | psrc-lq3wm (eu-central-1, AWS) |
+| Source topic | raw-messages |
+| Result topic | raw-messages-scan-results |
 
-80 messages were produced, 0 errors, 89 tag recommendations generated in the review-api.
+**Pipeline results — 250 messages, layer 3, via local_scanner.py:**
+
+| Tag | Detections |
+|---|---|
+| PII | 966 |
+| PHI | 188 |
+| PCI | 160 |
+| LOCATION | 145 |
+| GOVERNMENT_ID | 114 |
+| CREDENTIALS | 114 |
+| FINANCIAL | 112 |
+| MINOR | 56 |
+| GENETIC | 54 |
+| BIOMETRIC | 54 |
+| NPI | 24 |
+| **Total** | **1,987** |
+
+103 field/tag pairs applied to Schema Registry schema (subject: `raw-messages-value`, version id=100064).
+
+**Flink statement status:**
+- `raw-messages-scan-trigger-scheduled`: RUNNING — fires every 2 minutes (TUMBLE)
+- `raw-messages-scan-trigger-schema`: RUNNING — watches SR for schema version changes
+- `raw-messages-scan-driver`: RUNNING — interval join ready; UDF silently no-ops due to egress constraint
 
 ### Recommended runtime settings for Mac (local development)
 
@@ -378,6 +504,55 @@ kafka-pipeline          classifier-service      review-api          Stream Catal
       │                        │     (human reviews /recommendations)     │
       │                        │                    │── approve ─────────▶│
       │                        │                    │◀── 200 OK ──────────│
+```
+
+---
+
+## Sequence diagram — Flink scanner (current path with local_scanner.py)
+
+```
+local_scanner.py        classifier-service      Kafka (CC)          apply_tags.py
+      │                        │                    │                     │
+      │─── consumer.poll() ───────────────────────▶│                     │
+      │◀── Avro message ──────────────────────────│                     │
+      │                        │                    │                     │
+      │─── decode wire format  │                    │                     │
+      │─── POST /classify ────▶│                    │                     │
+      │◀── classification ─────│                    │                     │
+      │                        │                    │                     │
+      │─── producer.produce() ────────────────────▶│                     │
+      │    ({topic}-scan-results)                   │                     │
+      │                        │                    │                     │
+      │    [loop until count]  │                    │                     │
+      │                        │                    │                     │
+      │                        │                 (operator runs apply_tags.py)
+      │                        │                    │◀─ consume ─────────│
+      │                        │                    │                     │
+      │                        │                    │  group by max(ts)  │
+      │                        │                    │  dedupe by tag     │
+      │                        │                    │  fetch SR schema   │
+      │                        │                    │  patch + register  │
+```
+
+---
+
+## Sequence diagram — Flink scanner (future path, USING CONNECTIONS EA)
+
+```
+Flink (Statement C)     classifier-service      Kafka (CC)          apply_tags.py
+      │                        │                    │                     │
+      │◀── scan-triggers ─────────────────────────│                     │
+      │◀── {topic} messages ──────────────────────│  (interval join)    │
+      │                        │                    │                     │
+      │─── classify_fields() ─▶│                    │                     │
+      │    (via Connection obj) │                    │                     │
+      │◀── detected_entities ──│                    │                     │
+      │                        │                    │                     │
+      │─── INSERT INTO ────────────────────────────▶│                     │
+      │    ({topic}-scan-results)                   │                     │
+      │                        │                    │                     │
+      │    [continuous, per trigger]                │                     │
+      │                        │                 (operator runs apply_tags.py)
 ```
 
 ---

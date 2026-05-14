@@ -188,48 +188,94 @@ Produces 200 JSON messages covering all 11 tag types including nested structures
 
 ### Step 5 — Run the Flink SQL scanner
 
+> **Network constraint:** Confluent Cloud Flink compute pools have no outbound internet access.
+> The `classify_fields()` UDF cannot call an external classifier URL from inside the pool.
+> Statements A (scheduled trigger) and B (schema-evolution trigger) run correctly.
+> Statement C (scan driver) runs but the UDF silently produces no rows.
+>
+> Use `local_scanner.py` (Step 5b) as the classification path until the
+> **USING CONNECTIONS** Early Access feature is enabled for your org.
+
 ```bash
 # 1. Build the UDF JAR
 bash flink-scanner/scripts/build.sh
 
 # 2. Register all three UDFs in Confluent Cloud (once per environment)
-export CONFLUENT_ENVIRONMENT=env-xxxxx
-export CONFLUENT_COMPUTE_POOL=lfcp-xxxxx
 bash flink-scanner/scripts/register.sh
 # Registers: classify_fields(), schema_watcher(), apply_tag()
+# (requires CONFLUENT_ENVIRONMENT and CONFLUENT_COMPUTE_POOL set, or export before running)
 
 # 3. Fill in flink-scanner/scan.env with your credentials and schedule
 vim flink-scanner/scan.env
-#   SCAN_INTERVAL_MINUTES=60   ← how often Flink scans
-#   SAMPLE_WINDOW_MINUTES=2    ← how much data per scan
+#   SCAN_INTERVAL_MINUTES=2    ← short for testing; use 60 for production
+#   SAMPLE_WINDOW_MINUTES=1    ← how much data per scan
 #   SOURCE_TOPIC, CLASSIFIER_URL, SR_URL/KEY/SECRET, KAFKA_BOOTSTRAP/KEY/SECRET
 
 # 4. Start all three Flink statements (run once — they run continuously)
 bash flink-scanner/scripts/start_scan.sh
 # Starts:
-#   {topic}-scan-trigger-scheduled  — TUMBLE window, fires every N min
-#   {topic}-scan-trigger-schema     — SchemaWatcherUDF, reacts to SR version changes
-#   {topic}-scan-driver             — interval join, classifies last M min on each trigger
+#   {topic}-scan-trigger-scheduled  RUNNING — TUMBLE window, fires every N min
+#   {topic}-scan-trigger-schema     RUNNING — SchemaWatcherUDF, reacts to SR changes
+#   {topic}-scan-driver             RUNNING — interval join ready; UDF no-ops (see above)
 
-# 5. Fire a manual scan at any time
-bash flink-scanner/scripts/start_scan.sh --now
-
-# 6. When ready to review — run apply_tags.py
-source flink-scanner/scan.env
-python flink-scanner/apply_tags.py \
-  --topic     $SOURCE_TOPIC \
-  --sr-url    $SR_URL --sr-key $SR_KEY --sr-secret $SR_SECRET \
-  --bootstrap $KAFKA_BOOTSTRAP --kafka-key $KAFKA_KEY --kafka-secret $KAFKA_SECRET
-# → reads latest batch from {topic}-scan-results topic
-# → skips fields already tagged in schema
-# → prompts [y/n/q] for new/changed tags
-# → patches schema (AVRO / JSON Schema / Protobuf) → registers one new version
-
-# Check statement status
+# 5. Check status
 bash flink-scanner/scripts/start_scan.sh --status
 
 # Stop all scanner statements
 bash flink-scanner/scripts/start_scan.sh --stop
+```
+
+### Step 5b — Classify with local_scanner.py (current E2E path)
+
+`local_scanner.py` replicates Statement C's logic locally. It produces to the same
+`{topic}-scan-results` topic that `apply_tags.py` reads — the rest of the pipeline is identical.
+
+```bash
+source flink-scanner/scan.env
+
+# Produce fresh test data so messages are within the sample window
+python e2e/produce_test_data.py \
+  --bootstrap  $KAFKA_BOOTSTRAP \
+  --api-key    $KAFKA_KEY \
+  --api-secret $KAFKA_SECRET \
+  --count      200
+
+# Run local scanner — reads Kafka, calls local classifier, writes results to Kafka
+python e2e/local_scanner.py \
+  --bootstrap       $KAFKA_BOOTSTRAP \
+  --api-key         $KAFKA_KEY \
+  --api-secret      $KAFKA_SECRET \
+  --classifier-url  http://localhost:8000 \
+  --max-layer       3 \
+  --count           200
+
+# Expected output:
+#   250/200 messages processed  (1987 tag detections so far)
+#   Done. Processed 200 messages → 1987 tag detections.
+#   Tag summary:
+#     PII                   966
+#     PHI                   188
+#     PCI                   160
+#     ...
+#   Results written to Kafka topic: raw-messages-scan-results
+```
+
+### Step 6 — Apply tags to Schema Registry
+
+```bash
+source flink-scanner/scan.env
+
+python flink-scanner/apply_tags.py \
+  --topic     $SOURCE_TOPIC \
+  --sr-url    $SR_URL --sr-key $SR_KEY --sr-secret $SR_SECRET \
+  --bootstrap $KAFKA_BOOTSTRAP --kafka-key $KAFKA_KEY --kafka-secret $KAFKA_SECRET
+# → reads latest batch from {topic}-scan-results (groups by max scanned_at)
+# → skips fields already tagged in schema
+# → prompts [y/n/q] for new/changed tags
+# → patches schema (AVRO / JSON Schema / Protobuf) → registers one new version
+
+# To approve all without interactive prompt:
+python flink-scanner/apply_tags.py ... --yes
 ```
 
 ---

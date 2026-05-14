@@ -29,6 +29,7 @@ SQL_TEMPLATE="${SCANNER_DIR}/sql/scan.sql"
 : "${CONFLUENT_COMPUTE_POOL:?Set CONFLUENT_COMPUTE_POOL in scan.env}"
 : "${CONFLUENT_CLOUD_REGION:=us-east-1}"
 : "${CONFLUENT_CLOUD_PROVIDER:=aws}"
+: "${CONFLUENT_KAFKA_CLUSTER:?Set CONFLUENT_KAFKA_CLUSTER in scan.env (Kafka cluster ID, e.g. lkc-xxxxx)}"
 : "${SOURCE_TOPIC:?Set SOURCE_TOPIC in scan.env}"
 : "${CLASSIFIER_URL:?Set CLASSIFIER_URL in scan.env}"
 : "${CLASSIFIER_MAX_LAYER:=3}"
@@ -54,9 +55,18 @@ for arg in "$@"; do
 done
 
 # ── Shared flags ──────────────────────────────────────────────────────────────
+# flink statement create:  --environment --compute-pool --database
+# flink statement describe: --environment --cloud --region
+# flink statement delete:  --environment --cloud --region (no --compute-pool!)
+# flink statement list:    --environment --cloud --region (no --compute-pool!)
 FLINK_FLAGS=(
     --environment   "${CONFLUENT_ENVIRONMENT}"
     --compute-pool  "${CONFLUENT_COMPUTE_POOL}"
+    --database      "${CONFLUENT_KAFKA_CLUSTER}"
+)
+# For describe/list/delete — requires cloud+region, does NOT accept --compute-pool
+FLINK_FLAGS_GEO=(
+    --environment   "${CONFLUENT_ENVIRONMENT}"
     --cloud         "${CONFLUENT_CLOUD_PROVIDER}"
     --region        "${CONFLUENT_CLOUD_REGION}"
 )
@@ -75,10 +85,26 @@ resolve_sql() {
         | sed "s|{sr_secret}|${SR_SECRET}|g"
 }
 
-# Extract a named SQL block from the template (between two ── markers)
+# Extract a named SQL block from the template (between two marker comment lines)
 extract_block() {
     local label="$1"
-    sed -n "/── ${label}/,/── /{ /── ${label}/d; /── /q; p }" "${SQL_TEMPLATE}"
+    python3 - "${SQL_TEMPLATE}" "${label}" <<'PYEOF'
+import sys, re
+path, label = sys.argv[1], sys.argv[2]
+lines = open(path).readlines()
+inside = False
+buf = []
+for line in lines:
+    if not inside:
+        if label in line and line.strip().startswith('--'):
+            inside = True
+    else:
+        # stop at the next comment marker line (-- ── ...)
+        if re.match(r"--\s*\u2500\u2500", line) and label not in line:
+            break
+        buf.append(line)
+print("".join(buf).strip())
+PYEOF
 }
 
 # Submit a single long-running statement (idempotent — skips if already running)
@@ -86,7 +112,7 @@ submit_statement() {
     local name="$1"
     local sql="$2"
 
-    if confluent flink statement describe "${name}" "${FLINK_FLAGS[@]}" &>/dev/null; then
+    if confluent flink statement describe "${name}" "${FLINK_FLAGS_GEO[@]}" &>/dev/null; then
         echo "  [skip] ${name} already running"
         return
     fi
@@ -104,8 +130,8 @@ case "${MODE}" in
         echo "Statement status:"
         for name in "${STMT_A}" "${STMT_B}" "${STMT_C}"; do
             STATUS=$(confluent flink statement describe "${name}" \
-                "${FLINK_FLAGS[@]}" --output json 2>/dev/null \
-                | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('phase','NOT FOUND'))" \
+                "${FLINK_FLAGS_GEO[@]}" --output json 2>/dev/null \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','NOT FOUND'))" \
                 2>/dev/null || echo "NOT FOUND")
             printf "  %-50s %s\n" "${name}" "${STATUS}"
         done
@@ -115,7 +141,7 @@ case "${MODE}" in
         echo "Stopping scanner statements..."
         for name in "${STMT_A}" "${STMT_B}" "${STMT_C}"; do
             confluent flink statement delete "${name}" \
-                "${FLINK_FLAGS[@]}" --force 2>/dev/null \
+                "${FLINK_FLAGS_GEO[@]}" --force 2>/dev/null \
                 && echo "  [stopped] ${name}" \
                 || echo "  [skip]    ${name} not found"
         done
@@ -146,11 +172,48 @@ VALUES ('manual', '${SOURCE_TOPIC}', CURRENT_TIMESTAMP);"
         echo "  Classifier:      ${CLASSIFIER_URL}  (layer ${CLASSIFIER_MAX_LAYER})"
         echo ""
 
-        # Step 1: create the two Kafka-backed tables (idempotent)
+        # Step 1: create the two Kafka-backed tables (idempotent DDL via statement create)
         echo "Creating trigger and results tables if not exist..."
-        SETUP_SQL=$(resolve_sql "$(grep -A 40 'Step 1' "${SQL_TEMPLATE}" | \
-            sed -n '/CREATE TABLE/,/^);$/p' | head -60)")
-        confluent flink shell "${FLINK_FLAGS[@]}" <<< "${SETUP_SQL}"
+
+        DDL_TRIGGERS=$(resolve_sql "CREATE TABLE IF NOT EXISTS \`${SOURCE_TOPIC}-scan-triggers\` (
+    \`trigger_type\`  STRING,
+    \`source_topic\`  STRING,
+    \`triggered_at\`  TIMESTAMP_LTZ(3),
+    WATERMARK FOR \`triggered_at\` AS \`triggered_at\` - INTERVAL '10' SECONDS
+);")
+
+        DDL_RESULTS=$(resolve_sql "CREATE TABLE IF NOT EXISTS \`${SOURCE_TOPIC}-scan-results\` (
+    \`field_path\`    STRING,
+    \`tag\`           STRING,
+    \`confidence\`    DOUBLE,
+    \`layer\`         INT,
+    \`source\`        STRING,
+    \`example\`       STRING,
+    \`source_topic\`  STRING,
+    \`trigger_type\`  STRING,
+    \`scanned_at\`    TIMESTAMP_LTZ(3)
+) WITH (
+    'kafka.retention.time' = '604800000'
+);")
+
+        STMT_DDL_TRIGGERS="${SOURCE_TOPIC}-ddl-scan-triggers"
+        STMT_DDL_RESULTS="${SOURCE_TOPIC}-ddl-scan-results"
+
+        # Submit DDL statements — idempotent (IF NOT EXISTS in SQL)
+        # Use a unique name per run so re-runs always succeed
+        TS=$(date +%Y%m%d%H%M%S)
+        confluent flink statement create "${STMT_DDL_TRIGGERS}-${TS}" \
+            --sql "${DDL_TRIGGERS}" \
+            "${FLINK_FLAGS[@]}" \
+            && echo "  [ok]   scan-triggers table created" \
+            || echo "  [warn] scan-triggers DDL failed (table may already exist)"
+
+        confluent flink statement create "${STMT_DDL_RESULTS}-${TS}" \
+            --sql "${DDL_RESULTS}" \
+            "${FLINK_FLAGS[@]}" \
+            && echo "  [ok]   scan-results table created" \
+            || echo "  [warn] scan-results DDL failed (table may already exist)"
+
         echo ""
 
         # Step 2: submit the three long-running statements

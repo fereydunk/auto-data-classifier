@@ -72,12 +72,33 @@ Confluent Cloud Flink (3 continuous statements)
 apply_tags.py (run by operator when ready)
   ├─ reads latest batch from {topic}-scan-results
   ├─ skips fields already tagged in the schema (no re-prompt)
-  ├─ presents new/changed tags interactively [y/n/q]
+  ├─ presents new/changed tags interactively [y/n/q]  (or --yes to approve all)
   └─ fetches schema → patches all approved fields → registers one new version
 ```
 
-Manual trigger: start_scan.sh --now inserts a row into the trigger topic;
+Manual trigger: `start_scan.sh --now` inserts a row into the trigger topic;
 Statement C reacts within seconds.
+
+> **Current network constraint:** Confluent Cloud Flink compute pools have no outbound internet egress.
+> The `classify_fields()` UDF runs inside the pool and cannot reach an external classifier URL.
+> As a result, Statement C runs and produces zero rows — HTTP calls silently time out inside the UDF.
+>
+> **Workaround (production-ready today):** use `e2e/local_scanner.py`, which runs the same
+> classify → publish pipeline locally, writing results to the same `{topic}-scan-results` topic.
+> `apply_tags.py` then picks up those results identically.
+>
+> **Future — Full Flink UDF path:** Confluent Cloud Flink is adding a **USING CONNECTIONS** clause
+> (Early Access) that binds a UDF to a Connection object, allowing it to call external HTTP endpoints
+> over the public internet. Once enabled for your organisation, re-register `classify_fields` with:
+> ```sql
+> CREATE FUNCTION classify_fields
+>   AS 'io.confluent.scanner.ClassifyFieldsUDF'
+>   USING JAR 'confluent-artifact://<artifact-id>'
+>   USING CONNECTIONS (`classifier-service`);
+> ```
+> The Connection object is created with `confluent flink connection create` (type=rest, endpoint=classifier URL).
+> After that, Statement C works end-to-end without local_scanner.py.
+> See `flink-scanner/scripts/register.sh` for the exact command (currently commented out).
 
 All model inference is **100% local** — no data leaves your environment at runtime.
 
@@ -180,7 +201,10 @@ auto-data-classifier/
 │
 ├── e2e/                         End-to-end test tooling
 │   ├── start_classifier.sh      Start classifier natively (no Docker needed)
-│   ├── produce_test_data.py     Produce 200 realistic messages to Confluent
+│   ├── produce_test_data.py     Produce realistic messages (Confluent Avro wire format)
+│   ├── local_scanner.py         Local E2E scanner — replaces Flink UDF path while
+│   │                            USING CONNECTIONS EA is pending (reads Kafka, calls
+│   │                            classifier, writes to scan-results topic)
 │   └── verify_e2e.py            Smoke test: 11 /classify assertions + Kafka round-trip
 │
 ├── tests/                       Unit / integration test suite (222 tests)
@@ -234,8 +258,6 @@ vim flink-scanner/scan.env
 bash flink-scanner/scripts/build.sh
 
 # 3. Register UDFs in Confluent Cloud (once per environment)
-export CONFLUENT_ENVIRONMENT=env-xxxxx
-export CONFLUENT_COMPUTE_POOL=lfcp-xxxxx
 bash flink-scanner/scripts/register.sh
 
 # 4. Start all three Flink statements (runs continuously)
@@ -244,27 +266,58 @@ bash flink-scanner/scripts/start_scan.sh
 # 5. Trigger a manual scan at any time
 bash flink-scanner/scripts/start_scan.sh --now
 
-# 6. Review and apply tags when ready
+# 6. Scan data locally (workaround until USING CONNECTIONS EA is enabled)
 source flink-scanner/scan.env
+python e2e/local_scanner.py \
+  --bootstrap  $KAFKA_BOOTSTRAP \
+  --api-key    $KAFKA_KEY \
+  --api-secret $KAFKA_SECRET \
+  --classifier-url http://localhost:8000 \
+  --count 200
+# → reads raw-messages, classifies, writes to raw-messages-scan-results
+
+# 7. Review and apply tags when ready
 python flink-scanner/apply_tags.py \
   --topic     $SOURCE_TOPIC \
   --sr-url    $SR_URL --sr-key $SR_KEY --sr-secret $SR_SECRET \
   --bootstrap $KAFKA_BOOTSTRAP --kafka-key $KAFKA_KEY --kafka-secret $KAFKA_SECRET
+# Add --yes to auto-approve all (skips interactive prompt)
 ```
 
 ### End-to-end test
 
 ```bash
-# Start classifier + expose with ngrok
+# Start classifier
 bash e2e/start_classifier.sh           # terminal 1
+
+# (Optional) Expose via ngrok for smoke testing
 ngrok http 8000                        # terminal 2
 
 # Verify all layers
-.venv/bin/python e2e/verify_e2e.py --classifier-url https://xxxx.ngrok-free.app
+python e2e/verify_e2e.py --classifier-url http://localhost:8000
 
-# Produce test data
-.venv/bin/python e2e/produce_test_data.py \
-  --topic scanner-test --count 200
+# Produce test data to Confluent Cloud
+source flink-scanner/scan.env
+python e2e/produce_test_data.py \
+  --bootstrap  $KAFKA_BOOTSTRAP \
+  --api-key    $KAFKA_KEY \
+  --api-secret $KAFKA_SECRET \
+  --count      200
+
+# Run local scanner (classify + write results to Kafka)
+python e2e/local_scanner.py \
+  --bootstrap  $KAFKA_BOOTSTRAP \
+  --api-key    $KAFKA_KEY \
+  --api-secret $KAFKA_SECRET \
+  --classifier-url http://localhost:8000 \
+  --count 200
+
+# Apply tags to Schema Registry
+python flink-scanner/apply_tags.py \
+  --topic     raw-messages \
+  --sr-url    $SR_URL --sr-key $SR_KEY --sr-secret $SR_SECRET \
+  --bootstrap $KAFKA_BOOTSTRAP --kafka-key $KAFKA_KEY --kafka-secret $KAFKA_SECRET \
+  --yes
 
 # Run unit + integration tests
 pytest tests/ -q
