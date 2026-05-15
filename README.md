@@ -430,6 +430,8 @@ Note: `SCAN_INTERVAL_MINUTES` and `SAMPLE_WINDOW_MINUTES` are set in `flink-scan
 
 ## Docs
 
+- [PRFAQ](docs/PRFAQ.md) — press release + customer/internal FAQ (start here for the product story)
+- [Requirements](docs/REQUIREMENTS.md) — 1-pager: problem, goals, non-goals, personas, functional/non-functional requirements, success metrics
 - [Architecture](docs/ARCHITECTURE.md) — component design, data flows, sequence diagrams
 - [Taxonomy](docs/TAXONOMY.md) — all 11 tags, entity type mappings, confidence scoring
 - [Testing](docs/TESTING.md) — unit tests, integration tests, end-to-end test guide
